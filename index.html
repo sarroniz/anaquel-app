@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#F3F5F8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#15181E" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="anaquel">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="robots" content="noindex">
+  <title>anaquel</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="preload" href="fonts/literata-latin-opsz-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/atkinson-hyperlegible-next-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <div id="app" class="app" data-view="list">
+    <aside class="pane-list" aria-label="Referencias">
+      <header class="list-head">
+        <div class="brand-row">
+          <h1 class="brand">anaquel</h1>
+          <button id="btn-refresh" class="icon-btn" type="button" aria-label="Actualizar" title="Actualizar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+          </button>
+          <button id="btn-settings" class="icon-btn" type="button" aria-label="Ajustes" title="Ajustes">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          </button>
+        </div>
+        <label class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="q" type="search" enterkeyhint="search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                 placeholder="Título, autor, año, etiqueta, clave…" aria-label="Buscar en la biblioteca">
+        </label>
+        <div id="filters" class="filters" role="toolbar" aria-label="Filtros"></div>
+        <div class="list-meta">
+          <span id="count" aria-live="polite"></span>
+          <label class="sort">
+            <span class="visually-hidden">Ordenar</span>
+            <select id="sort">
+              <option value="relevance">Más relevantes</option>
+              <option value="year-desc">Más recientes</option>
+              <option value="year-asc">Más antiguas</option>
+              <option value="author">Autor</option>
+              <option value="title">Título</option>
+            </select>
+          </label>
+        </div>
+      </header>
+      <ol id="results" class="results" role="listbox" aria-label="Resultados"></ol>
+      <footer class="sync-status">
+        <span id="sync-status"></span>
+      </footer>
+    </aside>
+
+    <main id="detail" class="pane-detail" tabindex="-1"></main>
+  </div>
+
+  <section id="viewer" class="viewer" hidden aria-label="Lector de PDF">
+    <header class="viewer-bar">
+      <button class="btn-bar" type="button" data-v="close">Cerrar</button>
+      <p class="viewer-title" id="viewer-title"></p>
+      <div class="viewer-tools">
+        <button class="icon-btn" type="button" data-v="zoom-out" aria-label="Reducir">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg>
+        </button>
+        <button class="btn-bar zoom-label" type="button" data-v="zoom-fit" id="zoom-label" title="Ajustar al ancho">100 %</button>
+        <button class="icon-btn" type="button" data-v="zoom-in" aria-label="Ampliar">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5v14"/></svg>
+        </button>
+        <button class="icon-btn" type="button" data-v="flag" aria-label="Marcar para editar" id="viewer-flag">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 21V4h11l-1.5 4L16 12H5"/></svg>
+        </button>
+        <button class="icon-btn" type="button" data-v="share" aria-label="Compartir o abrir en otra app">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 8l5-5 5 5M5 13v7h14v-7"/></svg>
+        </button>
+      </div>
+    </header>
+    <div class="viewer-scroll" id="viewer-scroll">
+      <div class="viewer-pages" id="viewer-pages"></div>
+    </div>
+    <div class="viewer-progress" id="viewer-progress" hidden>
+      <div class="progress-track"><div class="progress-fill" id="viewer-progress-fill"></div></div>
+      <p id="viewer-progress-text">Descargando…</p>
+    </div>
+  </section>
+
+  <dialog id="flag-dialog" class="sheet">
+    <form method="dialog" id="flag-form">
+      <h2>Marcar para editar en el Mac</h2>
+      <p class="sheet-sub" id="flag-dialog-entry"></p>
+      <label class="field">
+        <span>Nota (opcional)</span>
+        <textarea id="flag-note" rows="3" placeholder="Por ejemplo: falta el DOI, revisar autores"></textarea>
+      </label>
+      <div class="sheet-actions">
+        <button class="btn" value="cancel" type="submit">Cancelar</button>
+        <button class="btn primary" value="ok" type="submit">Marcar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="sheet sheet-wide">
+    <form id="settings-form">
+      <h2 id="settings-title">Conectar con GitHub</h2>
+      <p class="sheet-sub">La app lee la biblioteca del repositorio privado que actualiza tu Mac. El token se guarda solo en este dispositivo.</p>
+      <div class="field-grid">
+        <label class="field">
+          <span>Usuario de GitHub</span>
+          <input id="set-owner" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sarroniz">
+        </label>
+        <label class="field">
+          <span>Repositorio de datos</span>
+          <input id="set-repo" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="anaquel-datos">
+        </label>
+        <label class="field">
+          <span>Rama</span>
+          <input id="set-branch" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="main">
+        </label>
+      </div>
+      <label class="field">
+        <span>Token de acceso</span>
+        <input id="set-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…">
+        <small>Un token de grano fino con acceso solo a ese repositorio y permiso «Contents: Read and write». Déjalo vacío para conservar el actual.</small>
+      </label>
+      <p class="form-error" id="settings-error" role="alert" hidden></p>
+      <div class="sheet-actions">
+        <button class="btn" type="button" id="settings-cancel">Cancelar</button>
+        <button class="btn primary" type="submit" id="settings-save">Conectar</button>
+      </div>
+
+      <section class="settings-extra" id="settings-extra" hidden>
+        <h3>Sin conexión</h3>
+        <p id="offline-summary">Los PDFs que abres se guardan en este dispositivo.</p>
+        <div class="progress-track" id="offline-progress" hidden><div class="progress-fill" id="offline-progress-fill"></div></div>
+        <div class="sheet-actions start">
+          <button class="btn" type="button" id="btn-save-all">Guardar todos los PDFs</button>
+          <button class="btn danger" type="button" id="btn-forget">Borrar datos de este dispositivo</button>
+        </div>
+      </section>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
