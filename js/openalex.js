@@ -101,16 +101,48 @@ export class OpenAlex {
     }));
   }
 
-  /** Trabajos de un autor. */
-  async byAuthor(id, { sort = 'recent', fromYear = '', page = 1, perPage = 25, signal } = {}) {
-    const filters = [`authorships.author.id:${id.split('/').pop()}`];
-    if (fromYear) filters.push(`publication_year:>${Number(fromYear) - 1}`);
+  /** Revistas, actas y otras fuentes cuyo nombre coincide. */
+  async searchSources(query, { signal } = {}) {
+    const data = await this.get('/sources', {
+      search: query, per_page: 15, select: 'id,display_name,host_organization_name,type,works_count,issn_l,summary_stats',
+    }, { signal });
+    return (data.results || []).map((x) => ({
+      id: x.id,
+      name: x.display_name,
+      publisher: x.host_organization_name || '',
+      type: x.type || '',
+      works: x.works_count || 0,
+      issn: x.issn_l || '',
+      h: x.summary_stats?.h_index || 0,
+    }));
+  }
+
+  /**
+   * Lista filtrada (trabajos de un autor, de una revista, que citan o son citados por otro),
+   * con búsqueda opcional dentro de la lista.
+   */
+  async filtered(filters, { query = '', sort = 'recent', fromYear = '', page = 1, perPage = 25, signal } = {}) {
+    const f = [...filters];
+    if (fromYear) f.push(`publication_year:>${Number(fromYear) - 1}`);
+    const byRelevance = query && (sort === 'relevance' || sort === 'affinity');
     const data = await this.get('/works', {
-      filter: filters.join(','),
-      sort: sort === 'cited' ? 'cited_by_count:desc' : 'publication_date:desc',
+      filter: f.join(','),
+      'search.title_and_abstract': query || '',
+      rerank: byRelevance && page === 1 ? 'true' : '',
+      sort: byRelevance ? '' : sort === 'cited' || sort === 'affinity' ? 'cited_by_count:desc' : 'publication_date:desc',
       per_page: perPage, page, select: FIELDS,
     }, { signal });
     return { count: data.meta?.count || 0, results: (data.results || []).map(normalizeWork) };
+  }
+
+  /** Trabajos de un autor. */
+  byAuthor(id, opts = {}) {
+    return this.filtered([`authorships.author.id:${id.split('/').pop()}`], opts);
+  }
+
+  /** Trabajos publicados en una revista o fuente. */
+  bySource(id, opts = {}) {
+    return this.filtered([`primary_location.source.id:${id.split('/').pop()}`], opts);
   }
 
   /** Identificadores de OpenAlex para una lista de DOI (50 por petición; cada una cuesta lo mínimo). */
@@ -129,18 +161,9 @@ export class OpenAlex {
   }
 
   /** Trabajos que citan a `id` (kind = 'cites') o que `id` cita (kind = 'refs'). */
-  async related(id, kind, { sort = 'cited', fromYear = '', page = 1, perPage = 25, signal } = {}) {
+  related(id, kind, opts = {}) {
     const short = id.split('/').pop();
-    const filters = [kind === 'cites' ? `cites:${short}` : `cited_by:${short}`];
-    if (fromYear) filters.push(`publication_year:>${Number(fromYear) - 1}`);
-    const data = await this.get('/works', {
-      filter: filters.join(','),
-      sort: sort === 'recent' ? 'publication_date:desc' : 'cited_by_count:desc',
-      per_page: perPage,
-      page,
-      select: FIELDS,
-    }, { signal });
-    return { count: data.meta?.count || 0, results: (data.results || []).map(normalizeWork) };
+    return this.filtered([kind === 'cites' ? `cites:${short}` : `cited_by:${short}`], { sort: 'cited', ...opts });
   }
 
   /** Busca un trabajo por DOI (consulta individual: no gasta presupuesto). */
@@ -191,6 +214,7 @@ export function normalizeWork(w) {
     authors,
     authorsShort: authorsShort(authors),
     venue: stripTags(src.display_name || ''),
+    sourceId: src.id || '',
     sourceType: src.type || '',
     volume: b.volume || '',
     issue: b.issue || '',

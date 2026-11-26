@@ -29,11 +29,12 @@ const state = {
   mode: 'library',         // library | web («Buscar artículos» en OpenAlex)
   libIndex: null,          // DOI y título → clave, para marcar los resultados que ya están en la biblioteca
   web: {
-    query: '', searchMode: 'topic', sort: 'relevance', fromYear: '', results: [], authors: [], count: 0, page: 1,
+    query: '', searchMode: 'topic', sort: 'relevance', sortAuto: false, fromYear: '',
+    results: [], authors: [], sources: [], count: 0, page: 1,
     loading: false, error: null, searched: false, context: null, selectedId: null,
   },
   libAuthors: new Map(),   // clave de autor → nº de referencias en la biblioteca
-  libVenues: new Set(),
+  libVenues: new Map(),    // clave de revista → nº de referencias en la biblioteca
   libOa: null,             // {sha, byId: id de OpenAlex → clave, byKey: clave → id}
   oaInfo: new Map(),       // clave de la biblioteca → {id, cited, refs} en OpenAlex
 };
@@ -110,10 +111,10 @@ function setLibrary(data) {
   state.byKey = new Map(state.entries.map((e) => [e.key, e]));
   state.libIndex = buildLibraryIndex(state.entries);
   state.libAuthors = new Map();
-  state.libVenues = new Set();
+  state.libVenues = new Map();
   for (const e of state.entries) {
     for (const k of e.authorKeys) state.libAuthors.set(k, (state.libAuthors.get(k) || 0) + 1);
-    if (e.venueKey) state.libVenues.add(e.venueKey);
+    if (e.venueKey) state.libVenues.set(e.venueKey, (state.libVenues.get(e.venueKey) || 0) + 1);
   }
   if (state.selectedKey && !state.byKey.has(state.selectedKey)) state.selectedKey = null;
 }
@@ -280,6 +281,7 @@ function effectiveSort() {
 
 function renderSort() {
   const hasQuery = !!state.query.trim();
+  els.sort.closest('.sort').hidden = false;
   els.sort.querySelector('option[value="relevance"]').disabled = !hasQuery;
   els.sort.value = effectiveSort();
 }
@@ -833,11 +835,12 @@ els.sort.addEventListener('change', () => {
   if (state.mode === 'web') {
     const prev = state.web.sort;
     state.web.sort = els.sort.value;
+    state.web.sortAuto = false;
     const sameSet = (prev === 'relevance' && state.web.sort === 'affinity') || state.web.searchMode === 'semantic';
     if (state.web.sort === 'affinity' && sameSet && state.web.results.length && !state.web.context) {
       applyAffinity();
       renderWebList();
-    } else if (state.web.searched && !(state.web.searchMode === 'author' && !state.web.context)) {
+    } else if (state.web.searched && (state.web.context || !['author', 'journal'].includes(state.web.searchMode))) {
       runWebSearch();
     }
     return;
@@ -873,6 +876,11 @@ els.results.addEventListener('click', (ev) => {
     if (a) showRelated('author', { id: a.id, label: a.name });
     return;
   }
+  if (row.dataset.sid) {
+    const src = state.web.sources.find((x) => x.id === row.dataset.sid);
+    if (src) showRelated('source', { id: src.id, label: src.name });
+    return;
+  }
   if (row.dataset.wid) selectWork(row.dataset.wid); else select(row.dataset.key);
 });
 
@@ -886,7 +894,7 @@ let pressOrigin = null;
 let suppressRowClick = false;
 
 function openMenu(row, x, y, { fromTouch = false } = {}) {
-  if (row.dataset.aid) return;
+  if (row.dataset.aid || row.dataset.sid) return;
   const item = (m, label) => `<button type="button" role="menuitem" data-m="${m}">${label}</button>`;
   if (row.dataset.wid) {
     const w = state.web.results.find((r) => r.id === row.dataset.wid);
@@ -1014,6 +1022,11 @@ els.detail.addEventListener('click', async (ev) => {
     }
     case 'web-open-lib': openInLibrary(b.dataset.key); break;
     case 'web-copy-bib': { const w = currentWork(); if (w) await copy(workToBibtex(w), 'BibTeX copiado'); break; }
+    case 'web-source': {
+      const w = currentWork();
+      if (w?.sourceId) showRelated('source', { id: w.sourceId, label: w.venue });
+      break;
+    }
     case 'web-cites':
     case 'web-refs': {
       const w = currentWork();
@@ -1106,10 +1119,16 @@ window.addEventListener('offline', renderStatus);
 
 const LIB_SORTS = [['relevance', 'Más relevantes'], ['year-desc', 'Más recientes'], ['year-asc', 'Más antiguas'], ['author', 'Autor'], ['title', 'Título']];
 const WEB_SORTS = [['relevance', 'Más relevantes'], ['affinity', 'Afines a tu biblioteca'], ['cited', 'Más citados'], ['recent', 'Más recientes']];
-const MODE_LABELS = { topic: 'Tema', author: 'Autor', semantic: 'Descripción' };
+const MODE_LABELS = { topic: 'Tema', author: 'Autor', journal: 'Revista', semantic: 'Descripción' };
+const CONTEXT_LABELS = { cites: 'Citan a', refs: 'Referencias de', author: 'Autor', source: 'Revista' };
+const CONTEXT_PLACEHOLDERS = {
+  cites: 'Buscar entre los que lo citan', refs: 'Buscar entre sus referencias',
+  author: 'Buscar entre sus trabajos', source: 'Buscar en esta revista',
+};
 const MODE_PLACEHOLDERS = {
   topic: 'Palabras clave o DOI',
   author: 'Nombre o apellido',
+  journal: 'Nombre de la revista',
   semantic: 'Una frase o un resumen',
 };
 let tiesVersion = 0;
@@ -1133,7 +1152,7 @@ function setMode(mode) {
   els.app.dataset.mode = mode;
   for (const b of document.querySelectorAll('.mode-switch [data-mode]')) b.setAttribute('aria-selected', String(b.dataset.mode === mode));
   els.q.value = mode === 'library' ? state.query : state.web.query;
-  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : MODE_PLACEHOLDERS[state.web.searchMode];
+  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : webPlaceholder();
   els.q.setAttribute('aria-label', mode === 'library' ? 'Buscar en la biblioteca' : 'Buscar artículos en OpenAlex');
   els.sort.innerHTML = (mode === 'library' ? LIB_SORTS : WEB_SORTS).map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
   els.results.scrollTop = 0;
@@ -1149,15 +1168,21 @@ document.querySelector('.mode-switch').addEventListener('click', (ev) => {
   if (b.dataset.mode === 'web' && !state.web.searched && wide.matches) els.q.focus();
 });
 
+function webPlaceholder() {
+  const w = state.web;
+  return w.context ? CONTEXT_PLACEHOLDERS[w.context.kind] : MODE_PLACEHOLDERS[w.searchMode];
+}
+
 function renderWebFilters() {
   const w = state.web;
   const y = new Date().getFullYear();
   let html = '';
   if (w.context) {
     html += `<button type="button" class="chip chip-facet" aria-pressed="true" data-kind="web-clear" title="Quitar">`
-      + `<span class="chip-k">${{ cites: 'Citan a', refs: 'Referencias de', author: 'Autor' }[w.context.kind]}:</span><span class="chip-v">${esc(w.context.label)}</span>${X_ICON}</button>`;
+      + `<span class="chip-k">${CONTEXT_LABELS[w.context.kind]}:</span><span class="chip-v">${esc(w.context.label)}</span>${X_ICON}</button>`;
   }
-  if (!w.context || w.context.kind !== 'author') {
+  if (state.mode === 'web') els.q.placeholder = webPlaceholder();
+  if (!w.context) {
     for (const [m, label] of Object.entries(MODE_LABELS)) {
       html += `<button type="button" class="chip chip-mode" aria-pressed="${w.searchMode === m}" data-kind="web-mode" data-value="${m}">${label}</button>`;
     }
@@ -1171,17 +1196,18 @@ function renderWebFilters() {
 function handleWebFilter(b) {
   const w = state.web;
   if (b.dataset.kind === 'web-clear') {
-    Object.assign(w, { context: null, results: [], count: 0, searched: false, selectedId: null, error: null });
+    Object.assign(w, { context: null, results: [], count: 0, searched: false, selectedId: null, error: null, query: '' });
+    if (w.sortAuto) { w.sort = 'relevance'; w.sortAuto = false; }
+    els.q.value = '';
     renderAll();
     if (wide.matches) els.q.focus();
     return;
   }
   if (b.dataset.kind === 'web-mode') {
     w.searchMode = b.dataset.value;
-    els.q.placeholder = MODE_PLACEHOLDERS[w.searchMode];
     renderWebFilters();
     if (els.q.value.trim()) runWebSearch();
-    else { Object.assign(w, { results: [], authors: [], searched: false, context: null, error: null }); renderWebList(); renderDetail(); }
+    else { Object.assign(w, { results: [], authors: [], sources: [], searched: false, context: null, error: null }); renderWebList(); renderDetail(); }
     if (wide.matches) els.q.focus();
     return;
   }
@@ -1198,7 +1224,7 @@ function workRowHtml(w) {
   return `<li><button type="button" class="row row-web${inLib ? ' in-lib' : ''}" data-wid="${esc(w.id)}"${sel ? ' aria-current="true"' : ''}>`
     + `<span class="row-year">${esc(w.year || '—')}</span>`
     + `<span class="row-body"><span class="row-title">${esc(w.title)}</span>`
-    + `<span class="row-sub"><span class="row-authors">${esc(w.authorsShort || 'Sin autor')}</span>${w.venue ? `<span class="row-venue">${esc(w.venue)}</span>` : ''}</span>`
+    + `<span class="row-sub"><span class="row-authors">${esc(w.authorsShort || 'Sin autor')}</span>${w.venue && state.web.context?.kind !== 'source' ? `<span class="row-venue">${esc(w.venue)}</span>` : ''}</span>`
     + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}${tieReason(w)}</span></span>`
     + `<span class="row-marks">${inLib ? '<span class="badge-lib" title="Ya está en tu biblioteca" aria-label="Ya está en tu biblioteca"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
     + `</button></li>`;
@@ -1206,9 +1232,12 @@ function workRowHtml(w) {
 
 function renderWebList() {
   const w = state.web;
-  els.sort.value = w.context && w.sort === 'relevance' ? 'cited' : w.sort;
+  const relOff = !!w.context && !w.query;
+  // Las listas de autores y revistas no se ordenan: el selector solo sirve para trabajos.
+  els.sort.closest('.sort').hidden = !w.context && ['author', 'journal'].includes(w.searchMode) && w.searched;
+  els.sort.value = relOff && w.sort === 'relevance' ? 'cited' : w.sort;
   const rel = els.sort.querySelector('option[value="relevance"]');
-  if (rel) rel.disabled = !!w.context;
+  if (rel) rel.disabled = relOff;
   if (w.error && !w.results.length) {
     els.count.textContent = '';
     els.results.innerHTML = `<li class="empty">${esc(w.error.message)}<div><button type="button" class="btn" data-act="web-retry">Reintentar</button></div></li>`;
@@ -1224,8 +1253,16 @@ function renderWebList() {
     els.results.innerHTML = `<li class="empty web-intro">
       <p><strong>Tema:</strong> palabras del título o del resumen, o un DOI. Para una frase exacta, ponla entre comillas: "voiced stops".</p>
       <p><strong>Autor:</strong> busca a una persona y ve todos sus trabajos.</p>
+      <p><strong>Revista:</strong> busca una revista y ve todo lo que ha publicado. Con la revista elegida, el buscador busca dentro de ella.</p>
       <p><strong>Descripción:</strong> escribe una frase o pega un resumen entero y encuentra trabajos parecidos.</p>
       <p>Pulsa Intro para buscar. Lo que ya está en tu biblioteca lleva una marca de verificación, y «Afines a tu biblioteca» ordena por cuántas de tus referencias cita cada trabajo.</p></li>`;
+    return;
+  }
+  if (w.searchMode === 'journal' && !w.context) {
+    els.count.textContent = w.sources.length ? `${w.sources.length} ${w.sources.length === 1 ? 'revista' : 'revistas'}` : '';
+    els.results.innerHTML = w.sources.length
+      ? w.sources.map(sourceRowHtml).join('')
+      : `<li class="empty">No encuentro revistas llamadas «${esc(w.query)}». Prueba con menos palabras o con el nombre completo.</li>`;
     return;
   }
   if (w.searchMode === 'author' && !w.context) {
@@ -1237,7 +1274,7 @@ function renderWebList() {
   }
   els.count.textContent = `${fmtN(w.count)} ${w.count === 1 ? 'resultado' : 'resultados'}`;
   if (!w.results.length) {
-    els.results.innerHTML = `<li class="empty">${w.context ? 'OpenAlex no tiene trabajos en esta lista.' : `Nada coincide con «${esc(w.query)}» en OpenAlex. Prueba con otras palabras o en inglés.`}</li>`;
+    els.results.innerHTML = `<li class="empty">${w.context ? (w.query ? `Nada coincide con «${esc(w.query)}» en esta lista.` : 'OpenAlex no tiene trabajos en esta lista.') : `Nada coincide con «${esc(w.query)}» en OpenAlex. Prueba con otras palabras o en inglés.`}</li>`;
     return;
   }
   const more = w.searchMode !== 'semantic' || w.context ? w.results.length < Math.min(w.count, 500) : false;
@@ -1251,8 +1288,15 @@ async function runWebSearch({ append = false } = {}) {
   const w = state.web;
   if (!append) {
     const q = els.q.value.trim();
-    if (q) { w.context = null; w.query = q; }
+    if (w.context) {
+      // Con una lista activa (revista, autor, citas), el buscador busca dentro de ella.
+      if (w.sortAuto) w.sort = q ? 'relevance' : (w.context.kind === 'cites' || w.context.kind === 'refs' ? 'cited' : 'recent');
+      w.query = q;
+    } else if (q) {
+      w.query = q;
+    }
     w.authors = [];
+    w.sources = [];
     if (!w.context && !w.query) return;
     w.page = 1;
     w.results = [];
@@ -1270,12 +1314,18 @@ async function runWebSearch({ append = false } = {}) {
   renderWebList();
   if (!append) { renderDetail(); els.results.scrollTop = 0; }
   try {
-    const apiSort = w.sort === 'affinity' ? (w.context ? 'cited' : 'relevance') : w.sort;
+    const apiSort = w.sort === 'affinity' ? (w.context && !w.query ? 'cited' : 'relevance') : w.sort;
     const opts = { sort: apiSort, fromYear: w.fromYear, page: w.page, signal: ctrl.signal };
     let res;
-    if (w.context?.kind === 'author') res = await oa().byAuthor(w.context.id, opts);
-    else if (w.context) res = await oa().related(w.context.id, w.context.kind, opts);
-    else if (w.searchMode === 'author') {
+    if (w.context) {
+      const listOpts = { ...opts, query: w.query };
+      res = w.context.kind === 'author' ? await oa().byAuthor(w.context.id, listOpts)
+        : w.context.kind === 'source' ? await oa().bySource(w.context.id, listOpts)
+          : await oa().related(w.context.id, w.context.kind, listOpts);
+    } else if (w.searchMode === 'journal') {
+      w.sources = rankSources(await oa().searchSources(w.query, { signal: ctrl.signal }));
+      res = { count: 0, results: [] };
+    } else if (w.searchMode === 'author') {
       w.authors = rankAuthors(await oa().searchAuthors(w.query, { signal: ctrl.signal }));
       res = { count: 0, results: [] };
     } else if (w.searchMode === 'topic' && asDoi(w.query)) {
@@ -1317,13 +1367,21 @@ function selectWork(id, { push = true } = {}) {
 function renderWorkDetail() {
   const w = currentWork();
   if (!w) {
-    els.detail.innerHTML = `<div class="detail-empty"><p>${state.web.searched ? 'Elige un resultado para ver su ficha.' : 'Los resultados de la búsqueda aparecerán en la lista.'}</p></div>`;
+    const sw = state.web;
+    const hint = !sw.searched ? 'Los resultados de la búsqueda aparecerán en la lista.'
+      : !sw.context && sw.searchMode === 'journal' ? 'Elige una revista para ver todo lo que ha publicado.'
+        : !sw.context && sw.searchMode === 'author' ? 'Elige a una persona para ver sus trabajos.'
+          : 'Elige un resultado para ver su ficha.';
+    els.detail.innerHTML = `<div class="detail-empty"><p>${hint}</p></div>`;
     return;
   }
   const inLib = findInLibrary(w, state.libIndex);
   const kind = [w.typeLabel, w.year].filter(Boolean).join(', ');
   const vol = w.volume ? (w.issue ? `${w.volume}(${w.issue})` : w.volume) : '';
-  const source = [w.venue ? `<cite>${esc(w.venue)}</cite>` : '', esc(vol), esc(w.pages)].filter(Boolean).join(', ');
+  const venueHtml = !w.venue ? ''
+    : w.sourceId ? `<cite><button type="button" class="facet" data-act="web-source" title="Ver todo lo publicado en esta revista">${esc(w.venue)}</button></cite>`
+      : `<cite>${esc(w.venue)}</cite>`;
+  const source = [venueHtml, esc(vol), esc(w.pages)].filter(Boolean).join(', ');
   const link = w.doi ? `<a class="entry-link" href="https://doi.org/${esc(w.doi)}" target="_blank" rel="noopener">doi.org/${esc(w.doi)}</a>` : '';
   const names = w.authors.map((a) => (a.first ? `${a.first} ${a.last}` : a.last));
   const by = names.length > 12 ? `${names.slice(0, 10).join(', ')} y ${names.length - 10} más`
@@ -1383,7 +1441,10 @@ function showRelated(kind, ref) {
   if (state.mode !== 'web') setMode('web');
   const w = state.web;
   w.context = { kind, id: ref.id, label: ref.label };
-  if (w.sort === 'relevance') w.sort = kind === 'author' ? 'recent' : 'cited';
+  if (w.sort === 'relevance' || w.sortAuto) {
+    w.sort = kind === 'author' || kind === 'source' ? 'recent' : 'cited';
+    w.sortAuto = true;
+  }
   els.q.value = '';
   w.query = '';
   runWebSearch();
@@ -1433,6 +1494,38 @@ function applyAffinity() {
   const w = state.web;
   const order = new Map(w.results.map((r, i) => [r.id, i]));
   w.results = [...w.results].sort((a, b) => libraryTies(b).score - libraryTies(a).score || order.get(a.id) - order.get(b.id));
+}
+
+/** Revistas: primero las que ya aparecen en tu biblioteca; después, revistas antes que repositorios u otras fuentes. */
+function rankSources(list) {
+  const typeBonus = { journal: 100, conference: 50, 'book series': 40 };
+  return list
+    .map((x, i) => {
+      const inLib = state.libVenues.get(venueKey(x.name)) || 0;
+      return { ...x, inLib, _s: (inLib ? 1000 + inLib : 0) + (typeBonus[x.type] || 0) - i * 0.01 };
+    })
+    .sort((a, b) => b._s - a._s);
+}
+
+const SOURCE_TYPES = { conference: 'Congreso', repository: 'Repositorio', 'book series': 'Colección', ebook_platform: 'Libros', metadata: 'Índice' };
+const SOURCE_STOP = /^(the|and|of|for|on|in|des|der|die|del|de|la|el|los|las|und|et|journal|revista)$/i;
+
+function sourceRowHtml(x) {
+  const words = x.name.replace(/[^\p{L}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  const main = words.filter((t) => !SOURCE_STOP.test(t));
+  const pick = main.length >= 2 ? main : words.filter((t) => !/^(the|of|for|on|in|and|de|del|la|el)$/i.test(t));
+  const initials = (pick.slice(0, 2).map((t) => t[0]).join('') || '?').toUpperCase();
+  const type = SOURCE_TYPES[x.type] || '';
+  const meta = [`${fmtN(x.works)} ${x.works === 1 ? 'trabajo' : 'trabajos'}`]
+    .concat(type ? `<span class="badge-oa">${type}</span>` : [])
+    .concat(x.inLib ? `<span class="reason">${x.inLib} en tu biblioteca</span>` : []);
+  return `<li><button type="button" class="row row-author row-source" data-sid="${esc(x.id)}">`
+    + `<span class="author-avatar source-avatar" aria-hidden="true">${esc(initials)}</span>`
+    + `<span class="row-body"><span class="row-title">${esc(x.name)}</span>`
+    + `<span class="row-sub"><span class="row-authors">${esc(x.publisher || (x.issn ? `ISSN ${x.issn}` : 'Editorial sin datos'))}</span></span>`
+    + `<span class="row-meta">${meta.join('')}</span>`
+    + `</span><span class="row-marks">${x.inLib ? '<span class="badge-lib" title="Tienes artículos de esta revista"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
+    + `</button></li>`;
 }
 
 /** Autores: primero los que ya están en tu biblioteca y los que trabajan en lenguaje o habla. */
