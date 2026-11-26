@@ -1,8 +1,8 @@
 // Lector de PDF basado en PDF.js: páginas en columna, renderizado bajo demanda y capa de texto seleccionable.
 
-import * as pdfjsLib from '../vendor/pdfjs/pdf.min.mjs';
+import * as pdfjsLib from '../pdfjs/pdf.min.mjs';
 
-const VENDOR = new URL('../vendor/pdfjs/', import.meta.url).href;
+const VENDOR = new URL('../pdfjs/', import.meta.url).href;
 pdfjsLib.GlobalWorkerOptions.workerSrc = VENDOR + 'pdf.worker.min.mjs';
 
 const MAX_CANVAS_PIXELS = 12_000_000;   // límite prudente para iPhone/iPad

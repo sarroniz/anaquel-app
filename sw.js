@@ -1,5 +1,5 @@
 // Service worker: la app funciona sin conexión. Sube VERSION al publicar cambios.
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = `anaquel-shell-${VERSION}`;
 const RUNTIME = `anaquel-runtime-${VERSION}`;
 
@@ -13,8 +13,8 @@ const SHELL_FILES = [
   './js/library.js',
   './js/store.js',
   './js/pdfviewer.js',
-  './vendor/pdfjs/pdf.min.mjs',
-  './vendor/pdfjs/pdf.worker.min.mjs',
+  './pdfjs/pdf.min.mjs',
+  './pdfjs/pdf.worker.min.mjs',
   './fonts/literata-latin-opsz-normal.woff2',
   './fonts/literata-latin-opsz-italic.woff2',
   './fonts/atkinson-hyperlegible-next-latin-400-normal.woff2',
@@ -46,7 +46,7 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.includes('/__pdf/')) return;
 
   // Archivos de PDF.js que se cargan bajo demanda (fuentes, cmaps, wasm): primero la caché.
-  if (url.pathname.includes('/vendor/pdfjs/') || url.pathname.includes('/fonts/')) {
+  if (url.pathname.includes('/pdfjs/') || url.pathname.includes('/fonts/')) {
     event.respondWith((async () => {
       const hit = await caches.match(req);
       if (hit) return hit;

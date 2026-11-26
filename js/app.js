@@ -1,6 +1,6 @@
 import { GitHub, GitHubError } from './github.js';
 import * as store from './store.js';
-import { normalizeEntry, search, sortResults, sourceLine, authorsFull, toBibtex } from './library.js';
+import { normalizeEntry, search, sortResults, sourceLine, authorsFull, toBibtex, fold, snippet } from './library.js';
 
 // ---------------------------------------------------------------- estado
 
@@ -280,7 +280,15 @@ function renderFilters() {
   els.filters.innerHTML = html;
 }
 
-function rowHtml(e, flags) {
+function snippetHtml(e, hit) {
+  if (!hit) return '';
+  const sn = snippet(hit.field === 'abstract' ? e.abstract : e.notes, hit.token);
+  if (!sn) return '';
+  const label = hit.field === 'abstract' ? 'Resumen' : 'Notas';
+  return `<span class="row-snippet"><span class="row-snippet-label">${label}:</span> ${esc(sn.pre)}${sn.hit ? `<mark>${esc(sn.hit)}</mark>` : ''}${esc(sn.post)}</span>`;
+}
+
+function rowHtml(e, flags, hit = null) {
   const flagged = !!flags[e.key];
   const pdf = hasPdf(e);
   const offline = pdf && state.cached.has(e.key);
@@ -288,7 +296,8 @@ function rowHtml(e, flags) {
   return `<li><button type="button" class="row${flagged ? ' is-flagged' : ''}" data-key="${esc(e.key)}"${sel ? ' aria-current="true"' : ''}>`
     + `<span class="row-year">${esc(e.year || '—')}</span>`
     + `<span class="row-body"><span class="row-title"><span class="hl">${esc(e.title)}</span></span>`
-    + `<span class="row-sub"><span class="row-authors">${esc(e.authorsShort || 'Sin autor')}</span>${e.venue ? `<span class="row-venue">${esc(e.venue)}</span>` : ''}</span></span>`
+    + `<span class="row-sub"><span class="row-authors">${esc(e.authorsShort || 'Sin autor')}</span>${e.venue ? `<span class="row-venue">${esc(e.venue)}</span>` : ''}</span>`
+    + snippetHtml(e, hit) + `</span>`
     + `<span class="row-marks">${pdf ? `<span class="mark-pdf${offline ? ' is-offline' : ''}" title="${offline ? 'PDF guardado en este dispositivo' : 'Tiene PDF'}">PDF</span>` : ''}</span>`
     + `</button></li>`;
 }
@@ -311,7 +320,7 @@ function renderList() {
       : 'No hay referencias con este filtro.'}</li>`;
     return;
   }
-  els.results.innerHTML = state.results.map((r) => rowHtml(r.entry, flags)).join('');
+  els.results.innerHTML = state.results.map((r) => rowHtml(r.entry, flags, r.hiddenHit)).join('');
 }
 
 function renderStatus() {
@@ -346,48 +355,70 @@ function renderDetail({ animateFlag } = {}) {
   const pdf = hasPdf(e);
   const src = sourceLine(e);
   const by = authorsFull(e.authors);
-  const rawRows = Object.entries(e.raw)
-    .filter(([k]) => !k.startsWith('_'))
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+  const kind = [e.typeLabel, e.year].filter(Boolean).join(', ');
+  const link = e.doi
+    ? `<a class="entry-link" href="https://doi.org/${esc(e.doi)}" target="_blank" rel="noopener">doi.org/${esc(e.doi)}</a>`
+    : e.url ? `<a class="entry-link" href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, ''))}</a>` : '';
+  const source = src.map((s, i) => (i === 0 && e.venue ? `<cite>${esc(s)}</cite>` : esc(s))).join(', ');
 
   els.detail.innerHTML = `
     <article class="entry${flag ? ' is-flagged' : ''}${animateFlag === e.key ? ' flag-animate' : ''}">
       <button type="button" class="back" data-act="back">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>anaquel
       </button>
-      <p class="entry-kind">${esc([e.typeLabel, e.year].filter(Boolean).join(', '))}</p>
+      ${kind || e.topics.length ? `<div class="entry-meta">
+        ${kind ? `<span class="entry-kind">${esc(kind)}</span>` : ''}
+        ${e.topics.map((t) => `<button type="button" class="tag" data-act="topic" data-topic="${esc(t)}" title="Ver todas las referencias con esta etiqueta">${esc(t)}</button>`).join('')}
+      </div>` : ''}
       <h2 class="entry-title"><span class="hl">${esc(e.title)}</span></h2>
       ${by ? `<p class="entry-authors">${esc(by)}${e.editorsOnly ? ' (ed.)' : ''}</p>` : ''}
-      ${src.length ? `<p class="entry-source">${src.map((s, i) => (i === 0 && e.venue ? `<cite>${esc(s)}</cite>` : esc(s))).join(', ')}</p>` : ''}
+      ${source || link ? `<p class="entry-source">${source}${source && link ? '. ' : ''}${link}</p>` : ''}
 
       <div class="entry-actions">
         <button type="button" class="btn primary" data-act="pdf"${pdf ? '' : ' disabled'}>${pdf ? 'Abrir PDF' : 'Sin PDF'}</button>
         ${flag
           ? '<button type="button" class="btn flag-on" data-act="unflag">Quitar marca</button>'
           : '<button type="button" class="btn" data-act="flag">Marcar para editar</button>'}
-        <button type="button" class="btn quiet" data-act="copy-key">Copiar clave</button>
-        <button type="button" class="btn quiet" data-act="copy-bib">Copiar BibTeX</button>
+        <button type="button" class="btn key-btn" data-act="copy-key" title="Copiar la clave" aria-label="Copiar la clave ${esc(e.key)}">
+          <span class="key-text">${esc(e.key)}</span>
+          <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>
+          <svg class="i-done" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>
+        </button>
       </div>
 
       ${flag ? `<p class="flag-note"><strong>Marcada para editar</strong> desde ${esc(flag.device || 'otro dispositivo')}${flag.at ? ` ${esc(formatTime(flag.at))}` : ''}${flag.note ? `: ${esc(flag.note)}` : '.'}</p>` : ''}
 
-      <dl class="entry-fields">
-        <dt>Clave</dt><dd><code>${esc(e.key)}</code></dd>
-        ${e.topics.length ? `<dt>Etiquetas</dt><dd class="tags">${e.topics.map((t) => `<button type="button" class="tag" data-act="topic" data-topic="${esc(t)}">${esc(t)}</button>`).join('')}</dd>` : ''}
-        ${e.doi ? `<dt>DOI</dt><dd><a href="https://doi.org/${esc(e.doi)}" target="_blank" rel="noopener">${esc(e.doi)}</a></dd>` : ''}
-        ${e.url && !e.doi ? `<dt>Enlace</dt><dd><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url.replace(/^https?:\/\//, ''))}</a></dd>` : ''}
-        ${e.keywords.length ? `<dt>Palabras clave</dt><dd>${esc(e.keywords.join(', '))}</dd>` : ''}
-      </dl>
-
-      ${e.notes ? `<section class="entry-section"><h3>Notas</h3><p class="prose">${esc(e.notes)}</p></section>` : ''}
-      ${e.abstract ? `<section class="entry-section"><h3>Resumen</h3><p class="prose">${esc(e.abstract)}</p></section>` : ''}
-
-      <details class="entry-raw">
-        <summary>Todos los campos de la base de datos</summary>
-        <dl>${rawRows}</dl>
+      <details class="entry-bib">
+        <summary>BibTeX</summary>
+        <pre>${esc(toBibtex(e))}</pre>
       </details>
+
+      ${e.abstract ? `<section class="entry-section"><h3>Resumen</h3><p class="prose">${highlightTerms(e.abstract)}</p></section>` : ''}
+      ${e.notes ? `<section class="entry-section"><h3>Notas</h3><p class="prose">${highlightTerms(e.notes)}</p></section>` : ''}
+      ${e.keywords.length ? `<p class="entry-keywords"><span>Palabras clave:</span> ${esc(e.keywords.join(', '))}</p>` : ''}
     </article>`;
+}
+
+/** Resalta en el texto las palabras de la búsqueda actual (sin distinguir acentos). */
+function highlightTerms(text) {
+  const tokens = fold(state.query).split(/\s+/).filter((t) => t.length > 1);
+  const folded = fold(text);
+  if (!tokens.length || folded.length !== text.length) return esc(text);
+  const ranges = [];
+  for (const t of tokens) {
+    let i = folded.indexOf(t);
+    while (i !== -1) { ranges.push([i, i + t.length]); i = folded.indexOf(t, i + t.length); }
+  }
+  if (!ranges.length) return esc(text);
+  ranges.sort((a, b) => a[0] - b[0]);
+  let out = '';
+  let pos = 0;
+  for (const [a, b] of ranges) {
+    if (a < pos) continue;
+    out += esc(text.slice(pos, a)) + `<mark>${esc(text.slice(a, b))}</mark>`;
+    pos = b;
+  }
+  return out + esc(text.slice(pos));
 }
 
 function setupHtml() {
@@ -743,8 +774,95 @@ els.filters.addEventListener('click', (ev) => {
 
 els.results.addEventListener('click', (ev) => {
   const row = ev.target.closest('.row');
-  if (row) select(row.dataset.key);
+  if (!row) return;
+  if (suppressRowClick) { suppressRowClick = false; ev.preventDefault(); return; }
+  select(row.dataset.key);
 });
+
+// ---------------------------------------------------------------- menú de la lista (pulsación larga / clic derecho)
+
+const menu = Object.assign(document.createElement('div'), { className: 'ctx-menu', hidden: true });
+menu.setAttribute('role', 'menu');
+document.body.append(menu);
+let pressTimer = null;
+let pressOrigin = null;
+let suppressRowClick = false;
+
+function openMenu(key, x, y, { fromTouch = false } = {}) {
+  const e = state.byKey.get(key);
+  if (!e) return;
+  menu.dataset.key = key;
+  const label = e.authorsShort ? `${e.authorsShort}${e.year ? ` (${e.year})` : ''}` : e.key;
+  menu.innerHTML = `<p class="ctx-title">${esc(label)}</p>
+    <button type="button" role="menuitem" data-m="bib">Copiar BibTeX</button>
+    <button type="button" role="menuitem" data-m="key">Copiar clave</button>
+    ${hasPdf(e) ? '<button type="button" role="menuitem" data-m="pdf">Abrir PDF</button>' : ''}`;
+  menu.hidden = false;
+  const w = menu.offsetWidth;
+  const h = menu.offsetHeight;
+  const left = Math.min(Math.max(8, fromTouch ? x - w / 2 : x), innerWidth - w - 8);
+  let top = fromTouch ? y - h - 14 : y;          // con el dedo, encima para que no lo tape
+  if (top < 8) top = Math.min(y + 14, innerHeight - h - 8);
+  if (top + h > innerHeight - 8) top = innerHeight - h - 8;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+  els.results.querySelector(`.row[data-key="${CSS.escape(key)}"]`)?.classList.add('is-pressed');
+  if (!fromTouch) menu.querySelector('button')?.focus({ preventScroll: true });
+}
+
+function closeMenu() {
+  if (menu.hidden) return;
+  menu.hidden = true;
+  for (const r of els.results.querySelectorAll('.row.is-pressed')) r.classList.remove('is-pressed');
+}
+
+menu.addEventListener('click', async (ev) => {
+  const b = ev.target.closest('[data-m]');
+  if (!b) return;
+  const key = menu.dataset.key;
+  const e = state.byKey.get(key);
+  closeMenu();
+  if (!e) return;
+  if (b.dataset.m === 'bib') await copy(toBibtex(e), 'BibTeX copiado');
+  else if (b.dataset.m === 'key') await copy(key, 'Clave copiada');
+  else if (b.dataset.m === 'pdf') openPdf(key);
+});
+
+menu.addEventListener('keydown', (ev) => {
+  const items = [...menu.querySelectorAll('[data-m]')];
+  const i = items.indexOf(document.activeElement);
+  if (ev.key === 'ArrowDown') { ev.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+  else if (ev.key === 'ArrowUp') { ev.preventDefault(); items[(i - 1 + items.length) % items.length]?.focus(); }
+  else if (ev.key === 'Escape') { ev.preventDefault(); closeMenu(); }
+});
+
+els.results.addEventListener('pointerdown', (ev) => {
+  const row = ev.target.closest('.row');
+  suppressRowClick = false;
+  if (!row || ev.pointerType === 'mouse') return;   // con ratón o trackpad se usa el clic derecho
+  pressOrigin = { x: ev.clientX, y: ev.clientY };
+  clearTimeout(pressTimer);
+  pressTimer = setTimeout(() => {
+    suppressRowClick = true;
+    openMenu(row.dataset.key, pressOrigin.x, pressOrigin.y, { fromTouch: true });
+  }, 500);
+});
+els.results.addEventListener('pointermove', (ev) => {
+  if (pressOrigin && Math.hypot(ev.clientX - pressOrigin.x, ev.clientY - pressOrigin.y) > 10) clearTimeout(pressTimer);
+});
+for (const t of ['pointerup', 'pointercancel', 'pointerleave']) els.results.addEventListener(t, () => clearTimeout(pressTimer));
+els.results.addEventListener('scroll', () => { clearTimeout(pressTimer); closeMenu(); }, { passive: true });
+els.results.addEventListener('contextmenu', (ev) => {
+  const row = ev.target.closest('.row');
+  if (!row) return;
+  ev.preventDefault();
+  clearTimeout(pressTimer);
+  if (menu.hidden || menu.dataset.key !== row.dataset.key) openMenu(row.dataset.key, ev.clientX, ev.clientY, { fromTouch: ev.pointerType === 'touch' });
+});
+document.addEventListener('pointerdown', (ev) => {
+  if (!menu.hidden && !menu.contains(ev.target) && !ev.target.closest('.row.is-pressed')) closeMenu();
+}, true);
+window.addEventListener('resize', closeMenu);
 
 els.detail.addEventListener('click', async (ev) => {
   const b = ev.target.closest('[data-act]');
@@ -756,7 +874,12 @@ els.detail.addEventListener('click', async (ev) => {
     case 'pdf': openPdf(key); break;
     case 'flag': askFlag(key); break;
     case 'unflag': clearFlag(key); break;
-    case 'copy-key': await copy(key, 'Clave copiada'); break;
+    case 'copy-key':
+      if (await copy(key, 'Clave copiada')) {
+        b.classList.add('is-copied');
+        setTimeout(() => b.classList.remove('is-copied'), 1400);
+      }
+      break;
     case 'copy-bib': if (e) await copy(toBibtex(e), 'BibTeX copiado'); break;
     case 'topic':
       state.filter = { kind: 'topic', topic: b.dataset.topic };
@@ -770,7 +893,14 @@ els.detail.addEventListener('click', async (ev) => {
 });
 
 async function copy(text, msg) {
-  try { await navigator.clipboard.writeText(text); toast(msg); } catch { toast('No se pudo copiar al portapapeles'); }
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(msg);
+    return true;
+  } catch {
+    toast('No se pudo copiar al portapapeles');
+    return false;
+  }
 }
 
 $('#btn-settings').addEventListener('click', () => openSettings());
@@ -786,7 +916,7 @@ window.addEventListener('popstate', () => {
 wide.addEventListener('change', () => { if (wide.matches) els.app.dataset.view = 'list'; });
 
 document.addEventListener('keydown', (ev) => {
-  if (els.settingsDialog.open || els.flagDialog.open) return;
+  if (els.settingsDialog.open || els.flagDialog.open || !menu.hidden) return;
   const typing = ev.target.matches('input, textarea, select');
   if (!els.viewer.hidden) {
     if (ev.key === 'Escape') closeViewer();

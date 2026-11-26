@@ -122,7 +122,8 @@ export function normalizeEntry(raw) {
     topics: topics.map(fold),
     venue: ' ' + fold(venue + ' ' + publisher),
     keywords: ' ' + fold(keywords.join(' ')),
-    body: ' ' + fold(`${notes} ${abstract}`),
+    abstract: ' ' + fold(abstract),
+    notes: ' ' + fold(notes),
     doi: fold(doi),
   };
   e.sortAuthor = e._f.lasts[0] || '~';
@@ -130,15 +131,20 @@ export function normalizeEntry(raw) {
   return e;
 }
 
-/** Devuelve [{entry, score}] para la consulta; sin consulta, score 0. */
+/**
+ * Devuelve [{entry, score, hiddenHit}] para la consulta; sin consulta, score 0.
+ * hiddenHit indica que alguna palabra solo aparece en el resumen o en las notas
+ * (la lista muestra entonces un fragmento para que se vea por qué ha salido).
+ */
 export function search(entries, query) {
   const tokens = fold(query).split(/\s+/).filter(Boolean);
-  if (!tokens.length) return entries.map((entry) => ({ entry, score: 0 }));
+  if (!tokens.length) return entries.map((entry) => ({ entry, score: 0, hiddenHit: null }));
   const out = [];
   for (const entry of entries) {
     const f = entry._f;
     let total = 0;
     let ok = true;
+    let hiddenHit = null;
     for (const t of tokens) {
       let s = 0;
       if (f.key === t) s += 60; else if (f.key.startsWith(t)) s += 14; else if (f.key.includes(t)) s += 4;
@@ -149,13 +155,37 @@ export function search(entries, query) {
       if (f.venue.includes(' ' + t)) s += 4;
       if (f.keywords.includes(t)) s += 3;
       if (f.doi && t.length > 3 && f.doi.includes(t)) s += 10;
-      if (f.body.includes(t)) s += 2;
+      const visible = s > 0;
+      let hidden = 0;
+      if (f.abstract.includes(' ' + t)) hidden += 4; else if (f.abstract.includes(t)) hidden += 2;
+      if (f.notes.includes(' ' + t)) hidden += 3; else if (f.notes.includes(t)) hidden += 2;
+      if (!visible && hidden && !hiddenHit) hiddenHit = { token: t, field: f.abstract.includes(t) ? 'abstract' : 'notes' };
+      s += hidden;
       if (!s) { ok = false; break; }
       total += s;
     }
-    if (ok) out.push({ entry, score: total });
+    if (ok) out.push({ entry, score: total, hiddenHit });
   }
   return out;
+}
+
+/** Fragmento de ~110 caracteres alrededor de la primera aparición de token: {pre, hit, post}. */
+export function snippet(text, token, width = 110) {
+  const folded = fold(text);
+  const i = folded.indexOf(token);
+  if (i === -1) return null;
+  const sameLength = folded.length === text.length;
+  const start = Math.max(0, i - Math.round(width * 0.35));
+  const end = Math.min(text.length, i + token.length + Math.round(width * 0.65));
+  // Ajustar a límites de palabra
+  let a = start === 0 ? 0 : text.indexOf(' ', start) + 1 || start;
+  let b = end === text.length ? end : text.lastIndexOf(' ', end);
+  if (b <= i + token.length) b = end;
+  if (a > i) a = start;
+  const pre = (a > 0 ? '…' : '') + text.slice(a, i);
+  const hit = sameLength ? text.slice(i, i + token.length) : '';
+  const post = text.slice(sameLength ? i + token.length : i, b) + (b < text.length ? '…' : '');
+  return { pre, hit, post };
 }
 
 export function sortResults(results, mode) {
