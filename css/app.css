@@ -187,6 +187,11 @@ a { color: var(--accent); text-underline-offset: .18em; }
 .chip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--paper); }
 .chip[aria-pressed="true"] .chip-n { color: inherit; opacity: .7; }
 .chip-flag[aria-pressed="true"] { background: var(--marker); border-color: transparent; color: var(--marker-ink); }
+.chip-facet { align-items: center; max-width: 16rem; }
+.chip-facet .chip-k { font-weight: 400; opacity: .75; flex: none; }
+.chip-facet .chip-v { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chip-facet .chip-n { flex: none; }
+.chip-facet svg { width: 13px; height: 13px; flex: none; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; margin-left: .05rem; }
 @media (hover: hover) { .chip:hover { border-color: var(--ink-3); } }
 
 .list-meta {
@@ -324,6 +329,20 @@ a { color: var(--accent); text-underline-offset: .18em; }
 .entry-source { margin-top: .3rem; font: 1rem/1.45 var(--sans); color: var(--ink-2); }
 .entry-source cite { font-family: var(--serif); font-style: italic; }
 .entry-link { overflow-wrap: anywhere; }
+
+/* Autores, año y fuente: pulsables para filtrar la lista */
+.facet {
+  font: inherit; color: inherit;
+  background: none; border: 0; margin: 0; padding: .05em 0;
+  cursor: pointer; text-align: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 28%, transparent);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: .22em;
+  border-radius: 3px;
+}
+@media (hover: hover) { .facet:hover { color: var(--accent); text-decoration-color: currentColor; } }
+.facet:active { color: var(--accent); }
 
 .entry-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1.7rem 0 1.4rem; }
 

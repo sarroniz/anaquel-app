@@ -1,6 +1,6 @@
 import { GitHub, GitHubError } from './github.js';
 import * as store from './store.js';
-import { normalizeEntry, search, sortResults, sourceLine, authorsFull, toBibtex, fold, snippet } from './library.js';
+import { normalizeEntry, search, sortResults, sourceLine, toBibtex, fold, snippet } from './library.js';
 
 // ---------------------------------------------------------------- estado
 
@@ -16,7 +16,7 @@ const state = {
   pending: [],             // cambios de marcas aún no enviados
   cached: new Map(),       // PDFs guardados en el dispositivo: clave → sha
   query: '',
-  filter: { kind: 'all', topic: '' },
+  filter: { kind: 'all', value: '', label: '' },   // all | pdf | flagged | topic | author | year | venue
   sortChoice: null,        // null = automático (relevancia si hay búsqueda, si no, más recientes)
   results: [],
   selectedKey: null,
@@ -246,7 +246,10 @@ function computeResults() {
   const f = state.filter;
   if (f.kind === 'pdf') list = list.filter(hasPdf);
   else if (f.kind === 'flagged') list = list.filter((e) => flags[e.key]);
-  else if (f.kind === 'topic') list = list.filter((e) => e.topics.includes(f.topic));
+  else if (f.kind === 'topic') list = list.filter((e) => e.topics.includes(f.value));
+  else if (f.kind === 'author') list = list.filter((e) => e.authorKeys.includes(f.value));
+  else if (f.kind === 'year') list = list.filter((e) => e.year === f.value);
+  else if (f.kind === 'venue') list = list.filter((e) => e.venueKey === f.value);
   const res = search(list, state.query);
   state.results = sortResults(res, effectiveSort());
 }
@@ -270,11 +273,20 @@ function renderFilters() {
   const topics = new Map();
   for (const e of state.entries) for (const t of e.topics) topics.set(t, (topics.get(t) || 0) + 1);
   const f = state.filter;
-  const chip = (kind, label, n, topic = '') => {
-    const on = f.kind === kind && (kind !== 'topic' || f.topic === topic);
-    return `<button type="button" class="chip${kind === 'flagged' ? ' chip-flag' : ''}" aria-pressed="${on}" data-kind="${kind}" data-topic="${esc(topic)}">${esc(label)}${n != null ? `<span class="chip-n">${n}</span>` : ''}</button>`;
+  const chip = (kind, label, n, value = '') => {
+    const on = f.kind === kind && (kind !== 'topic' || f.value === value);
+    return `<button type="button" class="chip${kind === 'flagged' ? ' chip-flag' : ''}" aria-pressed="${on}" data-kind="${kind}" data-value="${esc(value)}">${esc(label)}${n != null ? `<span class="chip-n">${n}</span>` : ''}</button>`;
   };
-  let html = chip('all', 'Todas', null) + chip('pdf', 'Con PDF', nPdf);
+  let html = '';
+  const FACETS = { author: 'Autor', year: 'Año', venue: 'Fuente' };
+  if (FACETS[f.kind]) {
+    const n = state.entries.filter((e) => (f.kind === 'author' ? e.authorKeys.includes(f.value)
+      : f.kind === 'year' ? e.year === f.value : e.venueKey === f.value)).length;
+    html += `<button type="button" class="chip chip-facet" aria-pressed="true" data-kind="clear" title="Quitar el filtro">`
+      + `<span class="chip-k">${FACETS[f.kind]}:</span><span class="chip-v">${esc(f.label)}</span><span class="chip-n">${n}</span>`
+      + `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>`;
+  }
+  html += chip('all', 'Todas', null) + chip('pdf', 'Con PDF', nPdf);
   if (nFlag || f.kind === 'flagged') html += chip('flagged', 'Marcadas', nFlag);
   for (const [t, n] of [...topics].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) html += chip('topic', t, n, t);
   els.filters.innerHTML = html;
@@ -354,12 +366,15 @@ function renderDetail({ animateFlag } = {}) {
   const flag = flags[e.key];
   const pdf = hasPdf(e);
   const src = sourceLine(e);
-  const by = authorsFull(e.authors);
-  const kind = [e.typeLabel, e.year].filter(Boolean).join(', ');
+  const facet = (kind, value, label, text = label) =>
+    `<button type="button" class="facet" data-act="facet" data-kind="${kind}" data-value="${esc(value)}" data-label="${esc(label)}" title="Ver todas las referencias de ${kind === 'year' ? 'este año' : kind === 'author' ? 'este autor' : 'esta fuente'}">${esc(text)}</button>`;
+  const kind = [e.typeLabel ? esc(e.typeLabel) : '', e.year ? facet('year', e.year, e.year) : ''].filter(Boolean).join(', ');
+  const names = e.authors.map((a, i) => facet('author', e.authorKeys[i], a.first ? `${a.first} ${a.last}` : a.last));
+  const byHtml = names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} y ${names[names.length - 1]}`;
   const link = e.doi
     ? `<a class="entry-link" href="https://doi.org/${esc(e.doi)}" target="_blank" rel="noopener">doi.org/${esc(e.doi)}</a>`
     : e.url ? `<a class="entry-link" href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, ''))}</a>` : '';
-  const source = src.map((s, i) => (i === 0 && e.venue ? `<cite>${esc(s)}</cite>` : esc(s))).join(', ');
+  const source = src.map((s, i) => (i === 0 && e.venue ? `<cite>${e.venueKey ? facet('venue', e.venueKey, e.venue) : esc(s)}</cite>` : esc(s))).join(', ');
 
   els.detail.innerHTML = `
     <article class="entry${flag ? ' is-flagged' : ''}${animateFlag === e.key ? ' flag-animate' : ''}">
@@ -367,11 +382,11 @@ function renderDetail({ animateFlag } = {}) {
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>anaquel
       </button>
       ${kind || e.topics.length ? `<div class="entry-meta">
-        ${kind ? `<span class="entry-kind">${esc(kind)}</span>` : ''}
-        ${e.topics.map((t) => `<button type="button" class="tag" data-act="topic" data-topic="${esc(t)}" title="Ver todas las referencias con esta etiqueta">${esc(t)}</button>`).join('')}
+        ${kind ? `<span class="entry-kind">${kind}</span>` : ''}
+        ${e.topics.map((t) => `<button type="button" class="tag" data-act="facet" data-kind="topic" data-value="${esc(t)}" data-label="${esc(t)}" title="Ver todas las referencias con esta etiqueta">${esc(t)}</button>`).join('')}
       </div>` : ''}
       <h2 class="entry-title"><span class="hl">${esc(e.title)}</span></h2>
-      ${by ? `<p class="entry-authors">${esc(by)}${e.editorsOnly ? ' (ed.)' : ''}</p>` : ''}
+      ${byHtml ? `<p class="entry-authors">${byHtml}${e.editorsOnly ? ' (ed.)' : ''}</p>` : ''}
       ${source || link ? `<p class="entry-source">${source}${source && link ? '. ' : ''}${link}</p>` : ''}
 
       <div class="entry-actions">
@@ -764,9 +779,9 @@ els.filters.addEventListener('click', (ev) => {
   const b = ev.target.closest('.chip');
   if (!b) return;
   const kind = b.dataset.kind;
-  const topic = b.dataset.topic;
-  const same = state.filter.kind === kind && state.filter.topic === topic;
-  state.filter = same || kind === 'all' ? { kind: 'all', topic: '' } : { kind, topic };
+  const value = b.dataset.value || '';
+  const same = state.filter.kind === kind && state.filter.value === value;
+  state.filter = same || kind === 'all' || kind === 'clear' ? { kind: 'all', value: '', label: '' } : { kind, value, label: value };
   renderFilters();
   renderList();
   els.results.scrollTop = 0;
@@ -881,16 +896,28 @@ els.detail.addEventListener('click', async (ev) => {
       }
       break;
     case 'copy-bib': if (e) await copy(toBibtex(e), 'BibTeX copiado'); break;
-    case 'topic':
-      state.filter = { kind: 'topic', topic: b.dataset.topic };
-      renderFilters(); renderList();
-      if (!wide.matches) backToList();
-      break;
+    case 'facet': applyFacet(b.dataset.kind, b.dataset.value, b.dataset.label); break;
     case 'settings': openSettings({ firstRun: true }); break;
     case 'refresh': refresh(); break;
     default: break;
   }
 });
+
+/** Filtra la lista por un autor, un año, una fuente o una etiqueta pulsados en la ficha. */
+function applyFacet(kind, value, label) {
+  state.filter = { kind, value, label };
+  els.q.value = '';
+  state.query = '';
+  renderFilters();
+  renderList();
+  els.results.scrollTop = 0;
+  els.filters.scrollLeft = 0;
+  if (!wide.matches) {
+    if (history.state?.key) history.back(); else backToList();
+  } else {
+    els.results.querySelector(`.row[data-key="${CSS.escape(state.selectedKey || '')}"]`)?.scrollIntoView({ block: 'nearest' });
+  }
+}
 
 async function copy(text, msg) {
   try {

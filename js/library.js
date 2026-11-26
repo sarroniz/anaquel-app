@@ -71,6 +71,15 @@ export function parseAuthors(str) {
     });
 }
 
+/** Clave para agrupar a un autor aunque su nombre aparezca escrito de formas distintas: apellido + inicial. */
+export function authorKey(a) {
+  return `${fold(a.last).replace(/[^a-z0-9]+/g, ' ').trim()}|${fold(a.first).replace(/[^a-z]/g, '').charAt(0)}`;
+}
+
+export function venueKey(v) {
+  return fold(v).replace(/^the\s+/, '').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
 export function authorsShort(list) {
   if (!list.length) return '';
   if (list.length === 1) return list[0].last;
@@ -126,6 +135,8 @@ export function normalizeEntry(raw) {
     notes: ' ' + fold(notes),
     doi: fold(doi),
   };
+  e.authorKeys = authors.map(authorKey);
+  e.venueKey = venueKey(venue);
   e.sortAuthor = e._f.lasts[0] || '~';
   e.sortTitle = fold(e.title).replace(/^(the|a|an|el|la|los|las|un|una)\s+/, '');
   return e;
