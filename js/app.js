@@ -1,6 +1,7 @@
 import { GitHub, GitHubError } from './github.js';
 import * as store from './store.js';
 import { normalizeEntry, search, sortResults, sourceLine, toBibtex, fold, snippet } from './library.js';
+import { OpenAlex, buildLibraryIndex, findInLibrary, workToBibtex, titleKey } from './openalex.js';
 
 // ---------------------------------------------------------------- estado
 
@@ -25,6 +26,13 @@ const state = {
   syncError: null,
   viewerKey: null,
   viewerBlob: null,
+  mode: 'library',         // library | web («Buscar artículos» en OpenAlex)
+  libIndex: null,          // DOI y título → clave, para marcar los resultados que ya están en la biblioteca
+  web: {
+    query: '', sort: 'relevance', fromYear: '', results: [], count: 0, page: 1,
+    loading: false, error: null, searched: false, context: null, selectedId: null,
+  },
+  oaInfo: new Map(),       // clave de la biblioteca → {id, cited, refs} en OpenAlex
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -97,6 +105,7 @@ function setLibrary(data) {
   const list = Array.isArray(data?.entries) ? data.entries : [];
   state.entries = list.map(normalizeEntry).filter((e) => e.key);
   state.byKey = new Map(state.entries.map((e) => [e.key, e]));
+  state.libIndex = buildLibraryIndex(state.entries);
   if (state.selectedKey && !state.byKey.has(state.selectedKey)) state.selectedKey = null;
 }
 
@@ -267,6 +276,7 @@ function renderSort() {
 }
 
 function renderFilters() {
+  if (state.mode === 'web') { renderWebFilters(); return; }
   const flags = effectiveFlags();
   const nFlag = state.entries.filter((e) => flags[e.key]).length;
   const nPdf = state.entries.filter(hasPdf).length;
@@ -315,6 +325,7 @@ function rowHtml(e, flags, hit = null) {
 }
 
 function renderList() {
+  if (state.mode === 'web') { renderWebList(); return; }
   computeResults();
   renderSort();
   const flags = effectiveFlags();
@@ -336,6 +347,11 @@ function renderList() {
 }
 
 function renderStatus() {
+  if (state.mode === 'web') {
+    els.status.textContent = `Resultados de OpenAlex${state.settings?.openalexKey ? '' : ' (sin clave)'}.`;
+    els.status.dataset.tone = '';
+    return;
+  }
   const pending = state.pending.length;
   const pendingText = pending ? ` ${pending === 1 ? '1 marca pendiente de enviar.' : `${pending} marcas pendientes de enviar.`}` : '';
   let text;
@@ -355,6 +371,7 @@ function renderStatus() {
 // ---------------------------------------------------------------- ficha
 
 function renderDetail({ animateFlag } = {}) {
+  if (state.mode === 'web') { renderWorkDetail(); return; }
   const e = state.byKey.get(state.selectedKey);
   if (!e) {
     els.detail.innerHTML = state.entries.length
@@ -403,6 +420,8 @@ function renderDetail({ animateFlag } = {}) {
 
       ${flag ? `<p class="flag-note"><strong>Marcada para editar</strong> desde ${esc(flag.device || 'otro dispositivo')}${flag.at ? ` ${esc(formatTime(flag.at))}` : ''}${flag.note ? `: ${esc(flag.note)}` : '.'}</p>` : ''}
 
+      ${oaLinksHtml(e)}
+
       <details class="entry-bib">
         <summary>BibTeX</summary>
         <pre>${esc(toBibtex(e))}</pre>
@@ -412,6 +431,7 @@ function renderDetail({ animateFlag } = {}) {
       ${e.notes ? `<section class="entry-section"><h3>Notas</h3><p class="prose">${highlightTerms(e.notes)}</p></section>` : ''}
       ${e.keywords.length ? `<p class="entry-keywords"><span>Palabras clave:</span> ${esc(e.keywords.join(', '))}</p>` : ''}
     </article>`;
+  loadOaInfo(e);
 }
 
 /** Resalta en el texto las palabras de la búsqueda actual (sin distinguir acentos). */
@@ -475,11 +495,23 @@ function select(key, { push = true, focusDetail = false } = {}) {
 
 function backToList() {
   els.app.dataset.view = 'list';
-  const row = els.results.querySelector(`.row[data-key="${CSS.escape(state.selectedKey || '')}"]`);
+  const row = state.mode === 'web'
+    ? els.results.querySelector(`.row[data-wid="${CSS.escape(state.web.selectedId || '')}"]`)
+    : els.results.querySelector(`.row[data-key="${CSS.escape(state.selectedKey || '')}"]`);
   row?.scrollIntoView({ block: 'nearest' });
 }
 
 function moveSelection(delta) {
+  if (state.mode === 'web') {
+    const list = state.web.results;
+    if (!list.length) return;
+    const i = list.findIndex((w) => w.id === state.web.selectedId);
+    const next = list[Math.min(list.length - 1, Math.max(0, i + delta))];
+    if (!next) return;
+    selectWork(next.id, { push: false });
+    els.results.querySelector(`.row[data-wid="${CSS.escape(next.id)}"]`)?.scrollIntoView({ block: 'nearest' });
+    return;
+  }
   if (!state.results.length) return;
   const idx = state.results.findIndex((r) => r.entry.key === state.selectedKey);
   const next = state.results[Math.min(state.results.length - 1, Math.max(0, idx + delta))];
@@ -657,6 +689,7 @@ function openSettings({ firstRun = false } = {}) {
   $('#set-branch').value = s.branch || 'main';
   $('#set-token').value = '';
   $('#set-token').required = !s.token;
+  $('#set-openalex').value = s.openalexKey || '';
   els.settingsTitle.textContent = state.settings ? 'Ajustes' : 'Conectar con GitHub';
   $('#settings-save').textContent = state.settings ? 'Guardar' : 'Conectar';
   $('#settings-cancel').hidden = firstRun && !state.settings;
@@ -682,8 +715,9 @@ els.settingsForm.addEventListener('submit', async (ev) => {
   const repo = $('#set-repo').value.trim();
   const branch = $('#set-branch').value.trim() || 'main';
   const token = $('#set-token').value.trim() || state.settings?.token || '';
+  const openalexKey = $('#set-openalex').value.trim();
   if (!owner || !repo || !token) return;
-  const next = { ...(state.settings || {}), owner, repo, branch, token };
+  const next = { ...(state.settings || {}), owner, repo, branch, token, openalexKey };
   const btn = $('#settings-save');
   btn.disabled = true;
   btn.textContent = 'Comprobando…';
@@ -691,6 +725,17 @@ els.settingsForm.addEventListener('submit', async (ev) => {
   try {
     const gh = makeClient(next);
     await gh.repoInfo();
+    if (openalexKey && openalexKey !== state.settings?.openalexKey) {
+      // Consulta individual: comprueba la clave sin gastar presupuesto.
+      try {
+        await new OpenAlex({ apiKey: openalexKey, base: localStorage.getItem('anaquel.openalexBase') || undefined })
+          .get('/works/W2169879729', { select: 'id' });
+      } catch (err) {
+        throw new Error(err.status === 401 || err.status === 403
+          ? 'OpenAlex no acepta esta clave. Cópiala de nuevo desde openalex.org/settings/api, o deja el campo vacío para buscar sin clave.'
+          : err.message);
+      }
+    }
     const sameRepo = state.settings && state.settings.owner === owner && state.settings.repo === repo && state.settings.branch === branch;
     if (!sameRepo) {
       state.libSha = null; state.flagsSha = null; state.tree = null; state.flags = {}; state.pending = [];
@@ -750,6 +795,7 @@ $('#btn-forget').addEventListener('click', async () => {
 
 let searchT;
 els.q.addEventListener('input', () => {
+  if (state.mode === 'web') { state.web.query = els.q.value; return; }   // en OpenAlex se busca al pulsar Intro
   clearTimeout(searchT);
   searchT = setTimeout(() => {
     state.query = els.q.value;
@@ -759,6 +805,12 @@ els.q.addEventListener('input', () => {
 });
 
 els.q.addEventListener('keydown', (ev) => {
+  if (state.mode === 'web') {
+    if (ev.key === 'Enter') { ev.preventDefault(); runWebSearch(); if (!wide.matches) els.q.blur(); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); moveSelection(state.web.selectedId ? 1 : 0); }
+    else if (ev.key === 'Escape' && els.q.value) { els.q.value = ''; state.web.query = ''; }
+    return;
+  }
   if (ev.key === 'ArrowDown') { ev.preventDefault(); moveSelection(state.selectedKey ? 1 : 0); }
   else if (ev.key === 'Enter' && state.results.length) {
     ev.preventDefault();
@@ -769,6 +821,11 @@ els.q.addEventListener('keydown', (ev) => {
 });
 
 els.sort.addEventListener('change', () => {
+  if (state.mode === 'web') {
+    state.web.sort = els.sort.value;
+    if (state.web.searched) runWebSearch();
+    return;
+  }
   // Elegir «Más recientes» sin búsqueda equivale al modo automático.
   state.sortChoice = els.sort.value === 'year-desc' && !state.query.trim() ? null : els.sort.value;
   renderList();
@@ -778,6 +835,7 @@ els.sort.addEventListener('change', () => {
 els.filters.addEventListener('click', (ev) => {
   const b = ev.target.closest('.chip');
   if (!b) return;
+  if (state.mode === 'web') { handleWebFilter(b); return; }
   const kind = b.dataset.kind;
   const value = b.dataset.value || '';
   const same = state.filter.kind === kind && state.filter.value === value;
@@ -788,10 +846,13 @@ els.filters.addEventListener('click', (ev) => {
 });
 
 els.results.addEventListener('click', (ev) => {
+  const act = ev.target.closest('[data-act]')?.dataset.act;
+  if (act === 'web-more') { runWebSearch({ append: true }); return; }
+  if (act === 'web-retry') { runWebSearch({ append: false, retry: true }); return; }
   const row = ev.target.closest('.row');
   if (!row) return;
   if (suppressRowClick) { suppressRowClick = false; ev.preventDefault(); return; }
-  select(row.dataset.key);
+  if (row.dataset.wid) selectWork(row.dataset.wid); else select(row.dataset.key);
 });
 
 // ---------------------------------------------------------------- menú de la lista (pulsación larga / clic derecho)
@@ -803,15 +864,27 @@ let pressTimer = null;
 let pressOrigin = null;
 let suppressRowClick = false;
 
-function openMenu(key, x, y, { fromTouch = false } = {}) {
-  const e = state.byKey.get(key);
-  if (!e) return;
-  menu.dataset.key = key;
-  const label = e.authorsShort ? `${e.authorsShort}${e.year ? ` (${e.year})` : ''}` : e.key;
-  menu.innerHTML = `<p class="ctx-title">${esc(label)}</p>
-    <button type="button" role="menuitem" data-m="bib">Copiar BibTeX</button>
-    <button type="button" role="menuitem" data-m="key">Copiar clave</button>
-    ${hasPdf(e) ? '<button type="button" role="menuitem" data-m="pdf">Abrir PDF</button>' : ''}`;
+function openMenu(row, x, y, { fromTouch = false } = {}) {
+  const item = (m, label) => `<button type="button" role="menuitem" data-m="${m}">${label}</button>`;
+  if (row.dataset.wid) {
+    const w = state.web.results.find((r) => r.id === row.dataset.wid);
+    if (!w) return;
+    const inLib = findInLibrary(w, state.libIndex);
+    menu.dataset.key = '';
+    menu.dataset.wid = w.id;
+    menu.innerHTML = `<p class="ctx-title">${esc(w.authorsShort ? `${w.authorsShort}${w.year ? ` (${w.year})` : ''}` : w.title)}</p>`
+      + item('w-bib', 'Copiar BibTeX') + (w.doi ? item('w-doi', 'Copiar DOI') : '')
+      + (w.url ? item('w-web', w.doi ? 'Ver en la editorial' : 'Ver en la web') : '')
+      + (inLib ? item('w-lib', 'Ver en mi biblioteca') : '');
+  } else {
+    const e = state.byKey.get(row.dataset.key);
+    if (!e) return;
+    menu.dataset.key = e.key;
+    menu.dataset.wid = '';
+    const label = e.authorsShort ? `${e.authorsShort}${e.year ? ` (${e.year})` : ''}` : e.key;
+    menu.innerHTML = `<p class="ctx-title">${esc(label)}</p>` + item('bib', 'Copiar BibTeX') + item('key', 'Copiar clave')
+      + (hasPdf(e) ? item('pdf', 'Abrir PDF') : '');
+  }
   menu.hidden = false;
   const w = menu.offsetWidth;
   const h = menu.offsetHeight;
@@ -821,7 +894,7 @@ function openMenu(key, x, y, { fromTouch = false } = {}) {
   if (top + h > innerHeight - 8) top = innerHeight - h - 8;
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
-  els.results.querySelector(`.row[data-key="${CSS.escape(key)}"]`)?.classList.add('is-pressed');
+  row.classList.add('is-pressed');
   if (!fromTouch) menu.querySelector('button')?.focus({ preventScroll: true });
 }
 
@@ -834,6 +907,16 @@ function closeMenu() {
 menu.addEventListener('click', async (ev) => {
   const b = ev.target.closest('[data-m]');
   if (!b) return;
+  if (menu.dataset.wid) {
+    const w = state.web.results.find((r) => r.id === menu.dataset.wid);
+    closeMenu();
+    if (!w) return;
+    if (b.dataset.m === 'w-bib') await copy(workToBibtex(w), 'BibTeX copiado');
+    else if (b.dataset.m === 'w-doi') await copy(w.doi, 'DOI copiado');
+    else if (b.dataset.m === 'w-web') window.open(w.url, '_blank', 'noopener');
+    else if (b.dataset.m === 'w-lib') openInLibrary(findInLibrary(w, state.libIndex));
+    return;
+  }
   const key = menu.dataset.key;
   const e = state.byKey.get(key);
   closeMenu();
@@ -859,7 +942,7 @@ els.results.addEventListener('pointerdown', (ev) => {
   clearTimeout(pressTimer);
   pressTimer = setTimeout(() => {
     suppressRowClick = true;
-    openMenu(row.dataset.key, pressOrigin.x, pressOrigin.y, { fromTouch: true });
+    openMenu(row, pressOrigin.x, pressOrigin.y, { fromTouch: true });
   }, 500);
 });
 els.results.addEventListener('pointermove', (ev) => {
@@ -872,7 +955,8 @@ els.results.addEventListener('contextmenu', (ev) => {
   if (!row) return;
   ev.preventDefault();
   clearTimeout(pressTimer);
-  if (menu.hidden || menu.dataset.key !== row.dataset.key) openMenu(row.dataset.key, ev.clientX, ev.clientY, { fromTouch: ev.pointerType === 'touch' });
+  const same = row.dataset.wid ? menu.dataset.wid === row.dataset.wid : menu.dataset.key === row.dataset.key;
+  if (menu.hidden || !same) openMenu(row, ev.clientX, ev.clientY, { fromTouch: ev.pointerType === 'touch' });
 });
 document.addEventListener('pointerdown', (ev) => {
   if (!menu.hidden && !menu.contains(ev.target) && !ev.target.closest('.row.is-pressed')) closeMenu();
@@ -885,7 +969,7 @@ els.detail.addEventListener('click', async (ev) => {
   const key = state.selectedKey;
   const e = state.byKey.get(key);
   switch (b.dataset.act) {
-    case 'back': if (history.state?.key) history.back(); else backToList(); break;
+    case 'back': if (history.state?.key || history.state?.wid) history.back(); else backToList(); break;
     case 'pdf': openPdf(key); break;
     case 'flag': askFlag(key); break;
     case 'unflag': clearFlag(key); break;
@@ -897,6 +981,23 @@ els.detail.addEventListener('click', async (ev) => {
       break;
     case 'copy-bib': if (e) await copy(toBibtex(e), 'BibTeX copiado'); break;
     case 'facet': applyFacet(b.dataset.kind, b.dataset.value, b.dataset.label); break;
+    case 'oa-cites':
+    case 'oa-refs': {
+      if (!e) break;
+      b.disabled = true;
+      const id = await resolveOaWork(e);
+      b.disabled = false;
+      if (id) showRelated(b.dataset.act === 'oa-cites' ? 'cites' : 'refs', { id, label: entryLabel(e) });
+      break;
+    }
+    case 'web-open-lib': openInLibrary(b.dataset.key); break;
+    case 'web-copy-bib': { const w = currentWork(); if (w) await copy(workToBibtex(w), 'BibTeX copiado'); break; }
+    case 'web-cites':
+    case 'web-refs': {
+      const w = currentWork();
+      if (w) showRelated(b.dataset.act === 'web-cites' ? 'cites' : 'refs', { id: w.id, label: entryLabel(w) });
+      break;
+    }
     case 'settings': openSettings({ firstRun: true }); break;
     case 'refresh': refresh(); break;
     default: break;
@@ -962,8 +1063,8 @@ document.addEventListener('keydown', (ev) => {
   if (typing) return;
   if (ev.key === 'ArrowDown' || ev.key === 'j') { ev.preventDefault(); moveSelection(1); }
   else if (ev.key === 'ArrowUp' || ev.key === 'k') { ev.preventDefault(); moveSelection(-1); }
-  else if (ev.key === 'Enter' && state.selectedKey && hasPdf(state.byKey.get(state.selectedKey))) { ev.preventDefault(); openPdf(state.selectedKey); }
-  else if (ev.key === 'f' && state.selectedKey) {
+  else if (state.mode === 'library' && ev.key === 'Enter' && state.selectedKey && hasPdf(state.byKey.get(state.selectedKey))) { ev.preventDefault(); openPdf(state.selectedKey); }
+  else if (state.mode === 'library' && ev.key === 'f' && state.selectedKey) {
     ev.preventDefault();
     if (effectiveFlags()[state.selectedKey]) clearFlag(state.selectedKey); else askFlag(state.selectedKey);
   } else if (ev.key === 'Escape' && !wide.matches && els.app.dataset.view === 'detail') backToList();
@@ -977,6 +1078,294 @@ document.addEventListener('visibilitychange', () => {
 
 window.addEventListener('online', () => { if (state.gh) { refresh({ quiet: true }); pushFlags(); } });
 window.addEventListener('offline', renderStatus);
+
+
+// ---------------------------------------------------------------- buscar artículos (OpenAlex)
+
+const LIB_SORTS = [['relevance', 'Más relevantes'], ['year-desc', 'Más recientes'], ['year-asc', 'Más antiguas'], ['author', 'Autor'], ['title', 'Título']];
+const WEB_SORTS = [['relevance', 'Más relevantes'], ['cited', 'Más citados'], ['recent', 'Más recientes']];
+const X_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
+let webAbort = null;
+
+function oa() {
+  return new OpenAlex({ apiKey: state.settings?.openalexKey || '', base: localStorage.getItem('anaquel.openalexBase') || undefined });
+}
+
+const fmtN = (n) => Number(n || 0).toLocaleString('es-ES');
+const entryLabel = (x) => `${x.authorsShort || 'Sin autor'}${x.year ? ` (${x.year})` : ''}`;
+const currentWork = () => state.web.results.find((w) => w.id === state.web.selectedId) || null;
+
+function setMode(mode) {
+  if (state.mode === mode) return;
+  closeMenu();
+  if (state.mode === 'library') state.query = els.q.value; else state.web.query = els.q.value;
+  state.mode = mode;
+  els.app.dataset.mode = mode;
+  for (const b of document.querySelectorAll('.mode-switch [data-mode]')) b.setAttribute('aria-selected', String(b.dataset.mode === mode));
+  els.q.value = mode === 'library' ? state.query : state.web.query;
+  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : 'Tema, autor, título o DOI';
+  els.q.setAttribute('aria-label', mode === 'library' ? 'Buscar en la biblioteca' : 'Buscar artículos en OpenAlex');
+  els.sort.innerHTML = (mode === 'library' ? LIB_SORTS : WEB_SORTS).map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  els.results.scrollTop = 0;
+  if (!wide.matches) els.app.dataset.view = 'list';
+  renderAll();
+}
+
+document.querySelector('.mode-switch').addEventListener('click', (ev) => {
+  const b = ev.target.closest('[data-mode]');
+  if (!b) return;
+  setMode(b.dataset.mode);
+  if (b.dataset.mode === 'web' && !state.web.searched && wide.matches) els.q.focus();
+});
+
+function renderWebFilters() {
+  const w = state.web;
+  const y = new Date().getFullYear();
+  let html = '';
+  if (w.context) {
+    html += `<button type="button" class="chip chip-facet" aria-pressed="true" data-kind="web-clear" title="Quitar">`
+      + `<span class="chip-k">${w.context.kind === 'cites' ? 'Citan a' : 'Referencias de'}:</span><span class="chip-v">${esc(w.context.label)}</span>${X_ICON}</button>`;
+  }
+  const yearChip = (v, label) => `<button type="button" class="chip" aria-pressed="${w.fromYear === v}" data-kind="web-year" data-value="${v}">${label}</button>`;
+  html += yearChip('', 'Cualquier año') + yearChip(String(y - 4), 'Últimos 5 años') + yearChip(String(y - 9), 'Últimos 10 años');
+  els.filters.innerHTML = html;
+}
+
+function handleWebFilter(b) {
+  const w = state.web;
+  if (b.dataset.kind === 'web-clear') {
+    Object.assign(w, { context: null, results: [], count: 0, searched: false, selectedId: null, error: null });
+    renderAll();
+    if (wide.matches) els.q.focus();
+    return;
+  }
+  if (b.dataset.kind === 'web-year') {
+    w.fromYear = b.dataset.value || '';
+    renderWebFilters();
+    if (w.searched) runWebSearch();
+  }
+}
+
+function workRowHtml(w) {
+  const inLib = findInLibrary(w, state.libIndex);
+  const sel = w.id === state.web.selectedId;
+  return `<li><button type="button" class="row row-web${inLib ? ' in-lib' : ''}" data-wid="${esc(w.id)}"${sel ? ' aria-current="true"' : ''}>`
+    + `<span class="row-year">${esc(w.year || '—')}</span>`
+    + `<span class="row-body"><span class="row-title">${esc(w.title)}</span>`
+    + `<span class="row-sub"><span class="row-authors">${esc(w.authorsShort || 'Sin autor')}</span>${w.venue ? `<span class="row-venue">${esc(w.venue)}</span>` : ''}</span>`
+    + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}</span></span>`
+    + `<span class="row-marks">${inLib ? '<span class="badge-lib" title="Ya está en tu biblioteca" aria-label="Ya está en tu biblioteca"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
+    + `</button></li>`;
+}
+
+function renderWebList() {
+  const w = state.web;
+  els.sort.value = w.context && w.sort === 'relevance' ? 'cited' : w.sort;
+  const rel = els.sort.querySelector('option[value="relevance"]');
+  if (rel) rel.disabled = !!w.context;
+  if (w.error && !w.results.length) {
+    els.count.textContent = '';
+    els.results.innerHTML = `<li class="empty">${esc(w.error.message)}<div><button type="button" class="btn" data-act="web-retry">Reintentar</button></div></li>`;
+    return;
+  }
+  if (w.loading && !w.results.length) {
+    els.count.textContent = w.context ? 'Cargando…' : 'Buscando…';
+    els.results.innerHTML = '';
+    return;
+  }
+  if (!w.searched) {
+    els.count.textContent = '';
+    els.results.innerHTML = `<li class="empty web-intro">Busca artículos, libros y tesis en OpenAlex por tema, autor, título o DOI, y pulsa Intro. Los que ya están en tu biblioteca llevan una marca de verificación.</li>`;
+    return;
+  }
+  els.count.textContent = `${fmtN(w.count)} ${w.count === 1 ? 'resultado' : 'resultados'}`;
+  if (!w.results.length) {
+    els.results.innerHTML = `<li class="empty">${w.context ? 'OpenAlex no tiene trabajos en esta lista.' : `Nada coincide con «${esc(w.query)}» en OpenAlex. Prueba con otras palabras o en inglés.`}</li>`;
+    return;
+  }
+  const more = w.results.length < Math.min(w.count, 500)
+    ? `<li class="more"><button type="button" class="btn" data-act="web-more"${w.loading ? ' disabled' : ''}>${w.loading ? 'Cargando…' : 'Cargar más resultados'}</button>${w.error ? `<p class="more-error">${esc(w.error.message)}</p>` : ''}</li>`
+    : '';
+  els.results.innerHTML = w.results.map(workRowHtml).join('') + more;
+}
+
+async function runWebSearch({ append = false } = {}) {
+  const w = state.web;
+  if (!append) {
+    const q = els.q.value.trim();
+    if (q) { w.context = null; w.query = q; }
+    if (!w.context && !w.query) return;
+    w.page = 1;
+    w.results = [];
+    w.selectedId = null;
+  } else {
+    w.page += 1;
+  }
+  const ctrl = new AbortController();
+  webAbort?.abort();
+  webAbort = ctrl;
+  w.loading = true;
+  w.error = null;
+  w.searched = true;
+  renderWebFilters();
+  renderWebList();
+  if (!append) { renderDetail(); els.results.scrollTop = 0; }
+  try {
+    const opts = { sort: w.sort, fromYear: w.fromYear, page: w.page, signal: ctrl.signal };
+    const res = w.context ? await oa().related(w.context.id, w.context.kind, opts) : await oa().search(w.query, opts);
+    if (webAbort !== ctrl) return;
+    w.count = res.count;
+    const seen = new Set(w.results.map((x) => x.id));
+    w.results = w.results.concat(res.results.filter((x) => !seen.has(x.id)));
+  } catch (err) {
+    if (err.name === 'AbortError' || webAbort !== ctrl) return;
+    w.error = err;
+    if (append) w.page -= 1;
+  }
+  w.loading = false;
+  renderWebList();
+  renderStatus();
+}
+
+function selectWork(id, { push = true } = {}) {
+  state.web.selectedId = id;
+  for (const b of els.results.querySelectorAll('.row[aria-current]')) b.removeAttribute('aria-current');
+  els.results.querySelector(`.row[data-wid="${CSS.escape(id)}"]`)?.setAttribute('aria-current', 'true');
+  renderDetail();
+  if (!wide.matches) {
+    els.app.dataset.view = 'detail';
+    els.detail.scrollTop = 0;
+    if (push) history.pushState({ wid: id }, '');
+  }
+}
+
+function renderWorkDetail() {
+  const w = currentWork();
+  if (!w) {
+    els.detail.innerHTML = `<div class="detail-empty"><p>${state.web.searched ? 'Elige un resultado para ver su ficha.' : 'Los resultados de la búsqueda aparecerán en la lista.'}</p></div>`;
+    return;
+  }
+  const inLib = findInLibrary(w, state.libIndex);
+  const kind = [w.typeLabel, w.year].filter(Boolean).join(', ');
+  const vol = w.volume ? (w.issue ? `${w.volume}(${w.issue})` : w.volume) : '';
+  const source = [w.venue ? `<cite>${esc(w.venue)}</cite>` : '', esc(vol), esc(w.pages)].filter(Boolean).join(', ');
+  const link = w.doi ? `<a class="entry-link" href="https://doi.org/${esc(w.doi)}" target="_blank" rel="noopener">doi.org/${esc(w.doi)}</a>` : '';
+  const names = w.authors.map((a) => (a.first ? `${a.first} ${a.last}` : a.last));
+  const by = names.length > 12 ? `${names.slice(0, 10).join(', ')} y ${names.length - 10} más`
+    : names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} y ${names[names.length - 1]}`;
+  const openUrl = w.pdfUrl || (w.oaUrl && w.oaUrl !== w.url ? w.oaUrl : '');
+  const primaryTaken = !!inLib;
+  els.detail.innerHTML = `
+    <article class="entry entry-web">
+      <button type="button" class="back" data-act="back">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>Resultados
+      </button>
+      <div class="entry-meta">
+        ${kind ? `<span class="entry-kind">${esc(kind)}</span>` : ''}
+        ${inLib ? '<span class="badge-lib-lg">En tu biblioteca</span>' : ''}
+        ${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}
+      </div>
+      <h2 class="entry-title">${esc(w.title)}</h2>
+      ${by ? `<p class="entry-authors">${esc(by)}</p>` : ''}
+      ${source || link ? `<p class="entry-source">${source}${source && link ? '. ' : ''}${link}</p>` : ''}
+
+      <div class="entry-actions">
+        ${inLib ? `<button type="button" class="btn primary" data-act="web-open-lib" data-key="${esc(inLib)}">Ver en mi biblioteca</button>` : ''}
+        ${openUrl ? `<a class="btn${primaryTaken ? '' : ' primary'}" href="${esc(openUrl)}" target="_blank" rel="noopener">${w.pdfUrl ? 'PDF en abierto' : 'Versión en abierto'}</a>` : ''}
+        ${w.url ? `<a class="btn${primaryTaken || openUrl ? '' : ' primary'}" href="${esc(w.url)}" target="_blank" rel="noopener">${w.doi ? 'Ver en la editorial' : 'Ver en la web'}</a>` : ''}
+        <button type="button" class="btn" data-act="web-copy-bib">Copiar BibTeX</button>
+      </div>
+
+      <div class="entry-links">
+        <span class="entry-links-label">En OpenAlex</span>
+        <button type="button" class="link-btn" data-act="web-cites"${w.cited ? '' : ' disabled'}>Quién lo cita <span class="n">${fmtN(w.cited)}</span></button>
+        <button type="button" class="link-btn" data-act="web-refs"${w.refs ? '' : ' disabled'}>Qué cita <span class="n">${fmtN(w.refs)}</span></button>
+      </div>
+
+      <details class="entry-bib">
+        <summary>BibTeX</summary>
+        <pre>${esc(workToBibtex(w))}</pre>
+      </details>
+
+      ${w.abstract
+        ? `<section class="entry-section"><h3>Resumen</h3><p class="prose">${esc(w.abstract)}</p></section>`
+        : '<p class="entry-note">OpenAlex no tiene el resumen de este trabajo.</p>'}
+    </article>`;
+}
+
+function openInLibrary(key) {
+  if (!key || !state.byKey.has(key)) return;
+  setMode('library');
+  select(key);
+  els.results.querySelector(`.row[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: 'nearest' });
+}
+
+/** Carga en la lista los trabajos que citan a una referencia (cites) o los que esta cita (refs). */
+function showRelated(kind, ref) {
+  const fromDetail = !wide.matches && els.app.dataset.view === 'detail';
+  if (state.mode !== 'web') setMode('web');
+  const w = state.web;
+  w.context = { kind, id: ref.id, label: ref.label };
+  if (w.sort === 'relevance') w.sort = 'cited';
+  els.q.value = '';
+  w.query = '';
+  runWebSearch();
+  if (fromDetail || !wide.matches) {
+    if (history.state?.key || history.state?.wid) history.back(); else backToList();
+  }
+}
+
+// Citas de las referencias de la biblioteca
+
+function oaLinksHtml(e) {
+  const info = state.oaInfo.get(e.key);
+  const n = (v) => (typeof v === 'number' ? ` <span class="n">${fmtN(v)}</span>` : '');
+  return `<div class="entry-links" data-oa-key="${esc(e.key)}">
+        <span class="entry-links-label">En OpenAlex</span>
+        <button type="button" class="link-btn" data-act="oa-cites"${info && !info.cited ? ' disabled' : ''}>Quién lo cita${n(info?.cited)}</button>
+        <button type="button" class="link-btn" data-act="oa-refs"${info && !info.refs ? ' disabled' : ''}>Qué cita${n(info?.refs)}</button>
+      </div>`;
+}
+
+/** Con DOI, consulta (gratis) el trabajo en OpenAlex para mostrar cuántas citas y referencias tiene. */
+async function loadOaInfo(e) {
+  if (!e?.doi || state.oaInfo.has(e.key) || !navigator.onLine) return;
+  state.oaInfo.set(e.key, undefined);
+  try {
+    const w = await oa().byDoi(e.doi);
+    state.oaInfo.set(e.key, { id: w.id, cited: w.cited, refs: w.refs });
+  } catch {
+    state.oaInfo.delete(e.key);
+    return;
+  }
+  const el = els.detail.querySelector(`.entry-links[data-oa-key="${CSS.escape(e.key)}"]`);
+  if (el && state.mode === 'library' && state.selectedKey === e.key) el.outerHTML = oaLinksHtml(e);
+}
+
+/** Identificador de OpenAlex de una referencia: por DOI o, si no tiene, buscando su título. */
+async function resolveOaWork(e) {
+  const known = state.oaInfo.get(e.key);
+  if (known?.id) return known.id;
+  try {
+    if (e.doi) {
+      const w = await oa().byDoi(e.doi);
+      state.oaInfo.set(e.key, { id: w.id, cited: w.cited, refs: w.refs });
+      return w.id;
+    }
+    const { results } = await oa().search(e.title, { perPage: 5 });
+    const t = titleKey(e.title);
+    const y = Number(e.year) || 0;
+    const hit = results.find((r) => titleKey(r.title) === t && (!y || !r.year || Math.abs(Number(r.year) - y) <= 1));
+    if (hit) {
+      state.oaInfo.set(e.key, { id: hit.id, cited: hit.cited, refs: hit.refs });
+      return hit.id;
+    }
+    toast('No encuentro esta referencia en OpenAlex');
+  } catch (err) {
+    toast(err.message || 'No se pudo consultar OpenAlex');
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------- arranque
 

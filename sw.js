@@ -1,5 +1,5 @@
 // Service worker: la app funciona sin conexión. Sube VERSION al publicar cambios.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const SHELL = `anaquel-shell-${VERSION}`;
 const RUNTIME = `anaquel-runtime-${VERSION}`;
 
@@ -11,6 +11,7 @@ const SHELL_FILES = [
   './js/app.js',
   './js/github.js',
   './js/library.js',
+  './js/openalex.js',
   './js/store.js',
   './js/pdfviewer.js',
   './pdfjs/pdf.min.mjs',
