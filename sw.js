@@ -1,5 +1,5 @@
 // Service worker: la app funciona sin conexión. Sube VERSION al publicar cambios.
-const VERSION = 'v4';
+const VERSION = 'v5';
 const SHELL = `anaquel-shell-${VERSION}`;
 const RUNTIME = `anaquel-runtime-${VERSION}`;
 

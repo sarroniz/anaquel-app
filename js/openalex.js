@@ -5,7 +5,16 @@ import { fold, parseAuthors, authorsShort } from './library.js';
 const FIELDS = [
   'id', 'doi', 'display_name', 'publication_year', 'type', 'authorships', 'primary_location',
   'cited_by_count', 'referenced_works_count', 'abstract_inverted_index', 'open_access', 'best_oa_location', 'biblio',
+  'referenced_works',
 ].join(',');
+
+const DOI_RE = /^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)?(10\.\d{4,9}\/\S+)$/i;
+
+/** Si el texto es un DOI, lo devuelve normalizado. */
+export function asDoi(text) {
+  const m = String(text || '').trim().match(DOI_RE);
+  return m ? m[1].replace(/[.,;]+$/, '') : '';
+}
 
 export class OpenAlexError extends Error {
   constructor(status, reason) {
@@ -47,26 +56,85 @@ export class OpenAlex {
     return res.json();
   }
 
-  /** Búsqueda libre. sort: relevance | cited | recent. fromYear: número o vacío. */
-  async search(query, { sort = 'relevance', fromYear = '', page = 1, perPage = 25, signal } = {}) {
+  /**
+   * Búsqueda de trabajos.
+   *  mode 'topic': palabras en título y resumen, reordenadas por un modelo (rerank) cuando se ordena por relevancia.
+   *  mode 'semantic': búsqueda por significado; mejor con frases largas o un resumen entero (máx. 50 resultados).
+   * sort: relevance | affinity | cited | recent (affinity se reordena en la app: aquí equivale a relevancia).
+   */
+  async search(query, { mode = 'topic', sort = 'relevance', fromYear = '', page = 1, perPage = 25, signal } = {}) {
     const filters = [];
     if (fromYear) filters.push(`publication_year:>${Number(fromYear) - 1}`);
+    const byRelevance = sort === 'relevance' || sort === 'affinity';
+    const params = { filter: filters.join(','), select: FIELDS };
+    if (mode === 'semantic') {
+      Object.assign(params, { 'search.semantic': query.slice(0, 2000), per_page: 50 });
+    } else {
+      Object.assign(params, {
+        'search.title_and_abstract': query,
+        rerank: byRelevance && page === 1 ? 'true' : '',
+        sort: sort === 'cited' ? 'cited_by_count:desc' : sort === 'recent' ? 'publication_date:desc' : '',
+        per_page: perPage,
+        page,
+      });
+    }
+    const data = await this.get('/works', params, { signal });
+    let results = (data.results || []).map(normalizeWork);
+    if (mode === 'semantic' && !byRelevance) {
+      results = results.sort(sort === 'cited' ? (a, b) => b.cited - a.cited : (a, b) => (b.year || '').localeCompare(a.year || ''));
+    }
+    return { count: mode === 'semantic' ? results.length : (data.meta?.count || 0), results };
+  }
+
+  /** Autores cuyo nombre coincide, con sus temas principales para distinguir homónimos. */
+  async searchAuthors(query, { signal } = {}) {
+    const data = await this.get('/authors', {
+      search: query, per_page: 15, select: 'id,display_name,works_count,cited_by_count,last_known_institutions,topics',
+    }, { signal });
+    return (data.results || []).map((a) => ({
+      id: a.id,
+      name: a.display_name,
+      works: a.works_count || 0,
+      cited: a.cited_by_count || 0,
+      institution: a.last_known_institutions?.[0]?.display_name || '',
+      topics: (a.topics || []).slice(0, 3).map((t) => t.display_name),
+    }));
+  }
+
+  /** Trabajos de un autor. */
+  async byAuthor(id, { sort = 'recent', fromYear = '', page = 1, perPage = 25, signal } = {}) {
+    const filters = [`authorships.author.id:${id.split('/').pop()}`];
+    if (fromYear) filters.push(`publication_year:>${Number(fromYear) - 1}`);
     const data = await this.get('/works', {
-      search: query,
       filter: filters.join(','),
-      sort: sort === 'cited' ? 'cited_by_count:desc' : sort === 'recent' ? 'publication_date:desc' : '',
-      per_page: perPage,
-      page,
-      select: FIELDS,
+      sort: sort === 'cited' ? 'cited_by_count:desc' : 'publication_date:desc',
+      per_page: perPage, page, select: FIELDS,
     }, { signal });
     return { count: data.meta?.count || 0, results: (data.results || []).map(normalizeWork) };
   }
 
+  /** Identificadores de OpenAlex para una lista de DOI (50 por petición; cada una cuesta lo mínimo). */
+  async resolveDois(dois, { signal } = {}) {
+    const out = new Map();
+    const clean = [...new Set(dois.map((d) => d.toLowerCase()).filter((d) => d && !/[|,]/.test(d)))];
+    for (let i = 0; i < clean.length; i += 50) {
+      const chunk = clean.slice(i, i + 50);
+      const data = await this.get('/works', { filter: `doi:${chunk.join('|')}`, per_page: 50, select: 'id,doi' }, { signal });
+      for (const w of data.results || []) {
+        const doi = (w.doi || '').replace(/^https?:\/\/(dx\.)?doi\.org\//i, '').toLowerCase();
+        if (doi) out.set(doi, w.id.split('/').pop());
+      }
+    }
+    return out;
+  }
+
   /** Trabajos que citan a `id` (kind = 'cites') o que `id` cita (kind = 'refs'). */
-  async related(id, kind, { sort = 'cited', page = 1, perPage = 25, signal } = {}) {
+  async related(id, kind, { sort = 'cited', fromYear = '', page = 1, perPage = 25, signal } = {}) {
     const short = id.split('/').pop();
+    const filters = [kind === 'cites' ? `cites:${short}` : `cited_by:${short}`];
+    if (fromYear) filters.push(`publication_year:>${Number(fromYear) - 1}`);
     const data = await this.get('/works', {
-      filter: kind === 'cites' ? `cites:${short}` : `cited_by:${short}`,
+      filter: filters.join(','),
       sort: sort === 'recent' ? 'publication_date:desc' : 'cited_by_count:desc',
       per_page: perPage,
       page,
@@ -134,6 +202,7 @@ export function normalizeWork(w) {
     pdfUrl: w.best_oa_location?.pdf_url || '',
     oaUrl: w.open_access?.oa_url || w.best_oa_location?.landing_page_url || '',
     url: doi ? `https://doi.org/${doi}` : (w.primary_location?.landing_page_url || ''),
+    refIds: (w.referenced_works || []).map((r) => r.split('/').pop()),
   };
 }
 

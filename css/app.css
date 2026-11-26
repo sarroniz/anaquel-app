@@ -297,10 +297,33 @@ a { color: var(--accent); text-underline-offset: .18em; }
   background: var(--accent-soft); border-radius: 999px;
 }
 .entry-meta .badge-oa { font-size: .84rem; padding: .18rem .62rem; }
+/* Buscar artículos: modos, autores y afinidad con la biblioteca */
+.chip-sep { flex: none; width: 1.5px; align-self: stretch; margin: .3rem .2rem; background: var(--rule); border-radius: 1px; }
+.reason { color: var(--accent); font-weight: 600; }
+.row-author { align-items: start; }
+.row-author .row-authors { max-width: none; white-space: normal; }
+.author-avatar {
+  display: grid; place-items: center;
+  width: 2.35rem; height: 2.35rem; border-radius: 50%;
+  font: 600 .82rem/1 var(--sans); letter-spacing: .02em;
+  color: var(--accent); background: var(--accent-soft);
+}
+.row[aria-current="true"] .author-avatar { background: var(--sheet); }
+.entry-affinity {
+  margin: -.3rem 0 1.1rem;
+  padding: .7rem .95rem;
+  font: .95rem/1.55 var(--sans); color: var(--ink-2);
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--sheet));
+  border-radius: 10px;
+}
+.entry-affinity .facet { color: var(--accent); }
+.empty.web-intro { display: grid; gap: .6rem; text-align: left; }
+.web-intro strong { color: var(--ink); }
+
 .more { padding: .8rem .5rem 1.2rem; text-align: center; }
 .more-error { margin-top: .6rem; font-size: .88rem; color: var(--danger); }
 .empty .btn { margin-top: .9rem; }
-.web-intro { text-align: left; max-width: 30rem; margin: 0 auto; }
+.web-intro { text-align: left; max-width: 30rem; margin: 0 auto; line-height: 1.5; }
 .row[aria-current="true"] mark { background: color-mix(in srgb, var(--accent) 24%, transparent); }
 .mark-pdf {
   display: inline-block;

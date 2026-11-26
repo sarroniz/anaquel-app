@@ -1,7 +1,7 @@
 import { GitHub, GitHubError } from './github.js';
 import * as store from './store.js';
-import { normalizeEntry, search, sortResults, sourceLine, toBibtex, fold, snippet } from './library.js';
-import { OpenAlex, buildLibraryIndex, findInLibrary, workToBibtex, titleKey } from './openalex.js';
+import { normalizeEntry, search, sortResults, sourceLine, toBibtex, fold, snippet, authorKey, venueKey, parseAuthors } from './library.js';
+import { OpenAlex, buildLibraryIndex, findInLibrary, workToBibtex, titleKey, asDoi } from './openalex.js';
 
 // ---------------------------------------------------------------- estado
 
@@ -29,9 +29,12 @@ const state = {
   mode: 'library',         // library | web («Buscar artículos» en OpenAlex)
   libIndex: null,          // DOI y título → clave, para marcar los resultados que ya están en la biblioteca
   web: {
-    query: '', sort: 'relevance', fromYear: '', results: [], count: 0, page: 1,
+    query: '', searchMode: 'topic', sort: 'relevance', fromYear: '', results: [], authors: [], count: 0, page: 1,
     loading: false, error: null, searched: false, context: null, selectedId: null,
   },
+  libAuthors: new Map(),   // clave de autor → nº de referencias en la biblioteca
+  libVenues: new Set(),
+  libOa: null,             // {sha, byId: id de OpenAlex → clave, byKey: clave → id}
   oaInfo: new Map(),       // clave de la biblioteca → {id, cited, refs} en OpenAlex
 };
 
@@ -106,6 +109,12 @@ function setLibrary(data) {
   state.entries = list.map(normalizeEntry).filter((e) => e.key);
   state.byKey = new Map(state.entries.map((e) => [e.key, e]));
   state.libIndex = buildLibraryIndex(state.entries);
+  state.libAuthors = new Map();
+  state.libVenues = new Set();
+  for (const e of state.entries) {
+    for (const k of e.authorKeys) state.libAuthors.set(k, (state.libAuthors.get(k) || 0) + 1);
+    if (e.venueKey) state.libVenues.add(e.venueKey);
+  }
   if (state.selectedKey && !state.byKey.has(state.selectedKey)) state.selectedKey = null;
 }
 
@@ -822,8 +831,15 @@ els.q.addEventListener('keydown', (ev) => {
 
 els.sort.addEventListener('change', () => {
   if (state.mode === 'web') {
+    const prev = state.web.sort;
     state.web.sort = els.sort.value;
-    if (state.web.searched) runWebSearch();
+    const sameSet = (prev === 'relevance' && state.web.sort === 'affinity') || state.web.searchMode === 'semantic';
+    if (state.web.sort === 'affinity' && sameSet && state.web.results.length && !state.web.context) {
+      applyAffinity();
+      renderWebList();
+    } else if (state.web.searched && !(state.web.searchMode === 'author' && !state.web.context)) {
+      runWebSearch();
+    }
     return;
   }
   // Elegir «Más recientes» sin búsqueda equivale al modo automático.
@@ -852,6 +868,11 @@ els.results.addEventListener('click', (ev) => {
   const row = ev.target.closest('.row');
   if (!row) return;
   if (suppressRowClick) { suppressRowClick = false; ev.preventDefault(); return; }
+  if (row.dataset.aid) {
+    const a = state.web.authors.find((x) => x.id === row.dataset.aid);
+    if (a) showRelated('author', { id: a.id, label: a.name });
+    return;
+  }
   if (row.dataset.wid) selectWork(row.dataset.wid); else select(row.dataset.key);
 });
 
@@ -865,6 +886,7 @@ let pressOrigin = null;
 let suppressRowClick = false;
 
 function openMenu(row, x, y, { fromTouch = false } = {}) {
+  if (row.dataset.aid) return;
   const item = (m, label) => `<button type="button" role="menuitem" data-m="${m}">${label}</button>`;
   if (row.dataset.wid) {
     const w = state.web.results.find((r) => r.id === row.dataset.wid);
@@ -1083,7 +1105,15 @@ window.addEventListener('offline', renderStatus);
 // ---------------------------------------------------------------- buscar artículos (OpenAlex)
 
 const LIB_SORTS = [['relevance', 'Más relevantes'], ['year-desc', 'Más recientes'], ['year-asc', 'Más antiguas'], ['author', 'Autor'], ['title', 'Título']];
-const WEB_SORTS = [['relevance', 'Más relevantes'], ['cited', 'Más citados'], ['recent', 'Más recientes']];
+const WEB_SORTS = [['relevance', 'Más relevantes'], ['affinity', 'Afines a tu biblioteca'], ['cited', 'Más citados'], ['recent', 'Más recientes']];
+const MODE_LABELS = { topic: 'Tema', author: 'Autor', semantic: 'Descripción' };
+const MODE_PLACEHOLDERS = {
+  topic: 'Palabras clave o DOI',
+  author: 'Nombre o apellido',
+  semantic: 'Una frase o un resumen',
+};
+let tiesVersion = 0;
+let libIdsPromise = null;
 const X_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
 let webAbort = null;
 
@@ -1103,12 +1133,13 @@ function setMode(mode) {
   els.app.dataset.mode = mode;
   for (const b of document.querySelectorAll('.mode-switch [data-mode]')) b.setAttribute('aria-selected', String(b.dataset.mode === mode));
   els.q.value = mode === 'library' ? state.query : state.web.query;
-  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : 'Tema, autor, título o DOI';
+  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : MODE_PLACEHOLDERS[state.web.searchMode];
   els.q.setAttribute('aria-label', mode === 'library' ? 'Buscar en la biblioteca' : 'Buscar artículos en OpenAlex');
   els.sort.innerHTML = (mode === 'library' ? LIB_SORTS : WEB_SORTS).map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
   els.results.scrollTop = 0;
   if (!wide.matches) els.app.dataset.view = 'list';
   renderAll();
+  if (mode === 'web') ensureLibraryIds();
 }
 
 document.querySelector('.mode-switch').addEventListener('click', (ev) => {
@@ -1124,7 +1155,13 @@ function renderWebFilters() {
   let html = '';
   if (w.context) {
     html += `<button type="button" class="chip chip-facet" aria-pressed="true" data-kind="web-clear" title="Quitar">`
-      + `<span class="chip-k">${w.context.kind === 'cites' ? 'Citan a' : 'Referencias de'}:</span><span class="chip-v">${esc(w.context.label)}</span>${X_ICON}</button>`;
+      + `<span class="chip-k">${{ cites: 'Citan a', refs: 'Referencias de', author: 'Autor' }[w.context.kind]}:</span><span class="chip-v">${esc(w.context.label)}</span>${X_ICON}</button>`;
+  }
+  if (!w.context || w.context.kind !== 'author') {
+    for (const [m, label] of Object.entries(MODE_LABELS)) {
+      html += `<button type="button" class="chip chip-mode" aria-pressed="${w.searchMode === m}" data-kind="web-mode" data-value="${m}">${label}</button>`;
+    }
+    html += '<span class="chip-sep" aria-hidden="true"></span>';
   }
   const yearChip = (v, label) => `<button type="button" class="chip" aria-pressed="${w.fromYear === v}" data-kind="web-year" data-value="${v}">${label}</button>`;
   html += yearChip('', 'Cualquier año') + yearChip(String(y - 4), 'Últimos 5 años') + yearChip(String(y - 9), 'Últimos 10 años');
@@ -1136,6 +1173,15 @@ function handleWebFilter(b) {
   if (b.dataset.kind === 'web-clear') {
     Object.assign(w, { context: null, results: [], count: 0, searched: false, selectedId: null, error: null });
     renderAll();
+    if (wide.matches) els.q.focus();
+    return;
+  }
+  if (b.dataset.kind === 'web-mode') {
+    w.searchMode = b.dataset.value;
+    els.q.placeholder = MODE_PLACEHOLDERS[w.searchMode];
+    renderWebFilters();
+    if (els.q.value.trim()) runWebSearch();
+    else { Object.assign(w, { results: [], authors: [], searched: false, context: null, error: null }); renderWebList(); renderDetail(); }
     if (wide.matches) els.q.focus();
     return;
   }
@@ -1153,7 +1199,7 @@ function workRowHtml(w) {
     + `<span class="row-year">${esc(w.year || '—')}</span>`
     + `<span class="row-body"><span class="row-title">${esc(w.title)}</span>`
     + `<span class="row-sub"><span class="row-authors">${esc(w.authorsShort || 'Sin autor')}</span>${w.venue ? `<span class="row-venue">${esc(w.venue)}</span>` : ''}</span>`
-    + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}</span></span>`
+    + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}${tieReason(w)}</span></span>`
     + `<span class="row-marks">${inLib ? '<span class="badge-lib" title="Ya está en tu biblioteca" aria-label="Ya está en tu biblioteca"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
     + `</button></li>`;
 }
@@ -1175,7 +1221,18 @@ function renderWebList() {
   }
   if (!w.searched) {
     els.count.textContent = '';
-    els.results.innerHTML = `<li class="empty web-intro">Busca artículos, libros y tesis en OpenAlex por tema, autor, título o DOI, y pulsa Intro. Los que ya están en tu biblioteca llevan una marca de verificación.</li>`;
+    els.results.innerHTML = `<li class="empty web-intro">
+      <p><strong>Tema:</strong> palabras del título o del resumen, o un DOI. Para una frase exacta, ponla entre comillas: "voiced stops".</p>
+      <p><strong>Autor:</strong> busca a una persona y ve todos sus trabajos.</p>
+      <p><strong>Descripción:</strong> escribe una frase o pega un resumen entero y encuentra trabajos parecidos.</p>
+      <p>Pulsa Intro para buscar. Lo que ya está en tu biblioteca lleva una marca de verificación, y «Afines a tu biblioteca» ordena por cuántas de tus referencias cita cada trabajo.</p></li>`;
+    return;
+  }
+  if (w.searchMode === 'author' && !w.context) {
+    els.count.textContent = w.authors.length ? `${w.authors.length} ${w.authors.length === 1 ? 'autor' : 'autores'}` : '';
+    els.results.innerHTML = w.authors.length
+      ? w.authors.map(authorRowHtml).join('')
+      : `<li class="empty">No encuentro autores llamados «${esc(w.query)}». Prueba con el apellido solo o con nombre y apellido.</li>`;
     return;
   }
   els.count.textContent = `${fmtN(w.count)} ${w.count === 1 ? 'resultado' : 'resultados'}`;
@@ -1183,10 +1240,11 @@ function renderWebList() {
     els.results.innerHTML = `<li class="empty">${w.context ? 'OpenAlex no tiene trabajos en esta lista.' : `Nada coincide con «${esc(w.query)}» en OpenAlex. Prueba con otras palabras o en inglés.`}</li>`;
     return;
   }
-  const more = w.results.length < Math.min(w.count, 500)
+  const more = w.searchMode !== 'semantic' || w.context ? w.results.length < Math.min(w.count, 500) : false;
+  const moreHtml = more
     ? `<li class="more"><button type="button" class="btn" data-act="web-more"${w.loading ? ' disabled' : ''}>${w.loading ? 'Cargando…' : 'Cargar más resultados'}</button>${w.error ? `<p class="more-error">${esc(w.error.message)}</p>` : ''}</li>`
     : '';
-  els.results.innerHTML = w.results.map(workRowHtml).join('') + more;
+  els.results.innerHTML = w.results.map(workRowHtml).join('') + moreHtml;
 }
 
 async function runWebSearch({ append = false } = {}) {
@@ -1194,6 +1252,7 @@ async function runWebSearch({ append = false } = {}) {
   if (!append) {
     const q = els.q.value.trim();
     if (q) { w.context = null; w.query = q; }
+    w.authors = [];
     if (!w.context && !w.query) return;
     w.page = 1;
     w.results = [];
@@ -1211,17 +1270,33 @@ async function runWebSearch({ append = false } = {}) {
   renderWebList();
   if (!append) { renderDetail(); els.results.scrollTop = 0; }
   try {
-    const opts = { sort: w.sort, fromYear: w.fromYear, page: w.page, signal: ctrl.signal };
-    const res = w.context ? await oa().related(w.context.id, w.context.kind, opts) : await oa().search(w.query, opts);
+    const apiSort = w.sort === 'affinity' ? (w.context ? 'cited' : 'relevance') : w.sort;
+    const opts = { sort: apiSort, fromYear: w.fromYear, page: w.page, signal: ctrl.signal };
+    let res;
+    if (w.context?.kind === 'author') res = await oa().byAuthor(w.context.id, opts);
+    else if (w.context) res = await oa().related(w.context.id, w.context.kind, opts);
+    else if (w.searchMode === 'author') {
+      w.authors = rankAuthors(await oa().searchAuthors(w.query, { signal: ctrl.signal }));
+      res = { count: 0, results: [] };
+    } else if (w.searchMode === 'topic' && asDoi(w.query)) {
+      try {
+        res = { count: 1, results: [await oa().byDoi(asDoi(w.query), { signal: ctrl.signal })] };
+      } catch (err) {
+        if (err.status !== 404) throw err;
+        res = { count: 0, results: [] };
+      }
+    } else res = await oa().search(w.query, { ...opts, mode: w.searchMode });
     if (webAbort !== ctrl) return;
     w.count = res.count;
     const seen = new Set(w.results.map((x) => x.id));
     w.results = w.results.concat(res.results.filter((x) => !seen.has(x.id)));
+    if (w.sort === 'affinity') applyAffinity();
   } catch (err) {
     if (err.name === 'AbortError' || webAbort !== ctrl) return;
     w.error = err;
     if (append) w.page -= 1;
   }
+  ensureLibraryIds();
   w.loading = false;
   renderWebList();
   renderStatus();
@@ -1276,6 +1351,8 @@ function renderWorkDetail() {
         <button type="button" class="btn" data-act="web-copy-bib">Copiar BibTeX</button>
       </div>
 
+      ${tiesHtml(w)}
+
       <div class="entry-links">
         <span class="entry-links-label">En OpenAlex</span>
         <button type="button" class="link-btn" data-act="web-cites"${w.cited ? '' : ' disabled'}>Quién lo cita <span class="n">${fmtN(w.cited)}</span></button>
@@ -1306,13 +1383,108 @@ function showRelated(kind, ref) {
   if (state.mode !== 'web') setMode('web');
   const w = state.web;
   w.context = { kind, id: ref.id, label: ref.label };
-  if (w.sort === 'relevance') w.sort = 'cited';
+  if (w.sort === 'relevance') w.sort = kind === 'author' ? 'recent' : 'cited';
   els.q.value = '';
   w.query = '';
   runWebSearch();
   if (fromDetail || !wide.matches) {
     if (history.state?.key || history.state?.wid) history.back(); else backToList();
   }
+}
+
+
+// Afinidad con la biblioteca: cuántas de tus referencias cita un trabajo y qué autores compartís.
+
+function libraryTies(w) {
+  if (w._ties && w._tiesV === tiesVersion) return w._ties;
+  const byId = state.libOa?.byId;
+  const cited = byId ? [...new Set(w.refIds.filter((id) => byId.has(id)).map((id) => byId.get(id)))] : [];
+  const authors = w.authors.filter((a) => state.libAuthors.has(authorKey(a))).map((a) => a.last);
+  const venue = !!(w.venue && state.libVenues.has(venueKey(w.venue)));
+  w._ties = { cited, authors, venue, score: cited.length * 3 + Math.min(authors.length, 3) * 2 + (venue ? 1 : 0) };
+  w._tiesV = tiesVersion;
+  return w._ties;
+}
+
+function tieReason(w) {
+  const t = libraryTies(w);
+  if (t.cited.length) return `<span class="reason">Cita ${t.cited.length} de tu biblioteca</span>`;
+  if (t.authors.length) return `<span class="reason">${t.authors.length > 1 ? 'Autores' : 'Autor'} en tu biblioteca: ${esc(t.authors.slice(0, 2).join(', '))}</span>`;
+  return '';
+}
+
+function tiesHtml(w) {
+  const t = libraryTies(w);
+  const parts = [];
+  if (t.cited.length) {
+    const shown = t.cited.slice(0, 6).map((k) => {
+      const e = state.byKey.get(k);
+      return `<button type="button" class="facet" data-act="web-open-lib" data-key="${esc(k)}">${esc(e ? entryLabel(e) : k)}</button>`;
+    });
+    const rest = t.cited.length - shown.length;
+    parts.push(`Cita ${t.cited.length === 1 ? 'un trabajo' : `${t.cited.length} trabajos`} de tu biblioteca: ${shown.join(', ')}${rest > 0 ? ` y ${rest} más` : ''}.`);
+  }
+  if (t.authors.length) parts.push(`${t.authors.length > 1 ? 'Autores' : 'Autor'} que ya tienes en tu biblioteca: ${esc(t.authors.join(', '))}.`);
+  return parts.length ? `<p class="entry-affinity">${parts.join(' ')}</p>` : '';
+}
+
+/** Orden «Afines a tu biblioteca»: por vínculos con tus referencias, sin perder el orden de relevancia en los empates. */
+function applyAffinity() {
+  const w = state.web;
+  const order = new Map(w.results.map((r, i) => [r.id, i]));
+  w.results = [...w.results].sort((a, b) => libraryTies(b).score - libraryTies(a).score || order.get(a.id) - order.get(b.id));
+}
+
+/** Autores: primero los que ya están en tu biblioteca y los que trabajan en lenguaje o habla. */
+function rankAuthors(list) {
+  const LANG = /lingu|phonet|phonol|language|speech|prosod|spanish|hispan|syntax|semantic|morpholog|dialect|bilingual/i;
+  return list
+    .map((a, i) => {
+      const [parsed] = parseAuthors(a.name);
+      const inLib = parsed ? state.libAuthors.get(authorKey(parsed)) || 0 : 0;
+      const lang = a.topics.some((t) => LANG.test(t));
+      return { ...a, inLib, lang, _s: (inLib ? 1000 + inLib : 0) + (lang ? 100 : 0) - i * 0.01 };
+    })
+    .sort((x, y) => y._s - x._s);
+}
+
+function authorRowHtml(a) {
+  const initials = a.name.split(/\s+/).filter(Boolean).map((p) => p[0]).filter((c) => /\p{L}/u.test(c)).slice(0, 2).join('').toUpperCase();
+  return `<li><button type="button" class="row row-author" data-aid="${esc(a.id)}">`
+    + `<span class="author-avatar" aria-hidden="true">${esc(initials)}</span>`
+    + `<span class="row-body"><span class="row-title">${esc(a.name)}</span>`
+    + `<span class="row-sub"><span class="row-authors">${esc(a.institution || 'Institución desconocida')}</span></span>`
+    + `<span class="row-meta">${fmtN(a.works)} ${a.works === 1 ? 'trabajo' : 'trabajos'}${a.inLib ? `<span class="reason">${a.inLib} en tu biblioteca</span>` : ''}</span>`
+    + (a.topics.length ? `<span class="row-snippet">${esc(a.topics.slice(0, 2).join('; '))}</span>` : '')
+    + `</span><span class="row-marks">${a.inLib ? '<span class="badge-lib" title="Tienes trabajos suyos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
+    + `</button></li>`;
+}
+
+/** Busca (una vez por versión de la biblioteca) el identificador de OpenAlex de tus referencias con DOI. */
+function ensureLibraryIds() {
+  if (!state.entries.length || !navigator.onLine) return null;
+  const sha = state.libSha || 'local';
+  if (state.libOa?.sha === sha) return null;
+  if (libIdsPromise) return libIdsPromise;
+  libIdsPromise = (async () => {
+    const cached = await store.get('oaLibIds');
+    let pairs;
+    if (cached?.sha === sha) pairs = cached.pairs;
+    else {
+      const withDoi = state.entries.filter((e) => e.doi);
+      const map = await oa().resolveDois(withDoi.map((e) => e.doi));
+      pairs = withDoi.filter((e) => map.has(e.doi.toLowerCase())).map((e) => [map.get(e.doi.toLowerCase()), e.key]);
+      await store.set('oaLibIds', { sha, pairs });
+    }
+    state.libOa = { sha, byId: new Map(pairs), byKey: new Map(pairs.map(([id, k]) => [k, id])) };
+    tiesVersion++;
+    if (state.mode === 'web') {
+      if (state.web.sort === 'affinity') applyAffinity();
+      renderWebList();
+      renderDetail();
+    }
+  })().catch((err) => console.warn('No se pudieron enlazar las referencias con OpenAlex', err)).finally(() => { libIdsPromise = null; });
+  return libIdsPromise;
 }
 
 // Citas de las referencias de la biblioteca
@@ -1346,6 +1518,8 @@ async function loadOaInfo(e) {
 async function resolveOaWork(e) {
   const known = state.oaInfo.get(e.key);
   if (known?.id) return known.id;
+  const fromLib = state.libOa?.byKey.get(e.key);
+  if (fromLib) return fromLib;
   try {
     if (e.doi) {
       const w = await oa().byDoi(e.doi);
