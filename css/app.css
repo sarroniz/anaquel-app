@@ -297,6 +297,38 @@ a { color: var(--accent); text-underline-offset: .18em; }
   background: var(--accent-soft); border-radius: 999px;
 }
 .entry-meta .badge-oa { font-size: .84rem; padding: .18rem .62rem; }
+/* Cola para añadir a la biblioteca: contorno del acento, todavía sin la marca llena de «En tu biblioteca» */
+.badge-queue {
+  display: inline-block; padding: .04rem .45rem;
+  font: 600 .74rem/1.35 var(--sans); color: var(--accent);
+  border: 1.5px solid color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 999px;
+}
+.badge-queue-lg { font-size: .84rem; padding: .14rem .6rem; }
+.queue-note {
+  margin: -.3rem 0 1.2rem;
+  padding: .75rem 1rem .8rem;
+  font: .97rem/1.5 var(--sans); color: var(--ink-2);
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 12px;
+}
+.queue-note strong { color: var(--ink); }
+.queue-note .link-btn { margin-top: .55rem; }
+.queue-error { margin-top: .4rem; color: var(--danger); }
+.tag-picker { display: flex; flex-wrap: wrap; gap: .4rem; max-height: 10.5rem; overflow: auto; padding: 2px; margin-bottom: .2rem; }
+.tag-picker .chip { font-weight: 500; }
+.tag-empty { font: .92rem/1.4 var(--sans); color: var(--ink-3); }
+.check { display: flex; gap: .6rem; align-items: flex-start; margin: .1rem 0 .5rem; font: .97rem/1.4 var(--sans); color: var(--ink); cursor: pointer; }
+.check input { flex: none; width: 1.15rem; height: 1.15rem; margin-top: .12rem; accent-color: var(--accent); }
+.sheet-note { margin: 0 0 1rem; font: .9rem/1.45 var(--sans); color: var(--ink-3); }
+.sheet-note:empty { display: none; }
+.sheet h2[tabindex]:focus { outline: none; }
+/* Botones siempre a la vista aunque el diálogo sea más alto que la pantalla */
+#add-dialog .sheet-actions {
+  position: sticky; bottom: -1.35rem; z-index: 1;
+  margin: 0 -1.5rem -1.35rem; padding: .75rem 1.5rem 1.35rem;
+  background: var(--sheet);
+  box-shadow: 0 -1px 0 var(--rule);
+}
 /* Buscar artículos: modos, autores y afinidad con la biblioteca */
 .chip-sep { flex: none; width: 1.5px; align-self: stretch; margin: .3rem .2rem; background: var(--rule); border-radius: 1px; }
 .reason { color: var(--accent); font-weight: 600; }
@@ -701,6 +733,11 @@ dialog[open] { animation: sheet-in .22s var(--ease); }
     width: 100%; max-width: 100%;
     margin: auto 0 0;
     border-radius: 18px 18px 0 0;
+    padding-bottom: calc(1.4rem + env(safe-area-inset-bottom));
+  }
+  #add-dialog .sheet-actions {
+    bottom: calc(-1.4rem - env(safe-area-inset-bottom));
+    margin-bottom: calc(-1.4rem - env(safe-area-inset-bottom));
     padding-bottom: calc(1.4rem + env(safe-area-inset-bottom));
   }
   .field-grid { grid-template-columns: 1fr 1fr; }

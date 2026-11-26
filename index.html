@@ -109,6 +109,37 @@
     </form>
   </dialog>
 
+  <dialog id="add-dialog" class="sheet sheet-wide">
+    <form method="dialog" id="add-form">
+      <h2 tabindex="-1" autofocus>Añadir a la biblioteca</h2>
+      <p class="sheet-sub" id="add-entry"></p>
+      <label class="field">
+        <span>Clave</span>
+        <input id="add-key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <div class="field">
+        <span id="add-tags-label">Etiquetas</span>
+        <div class="tag-picker" id="add-tags" role="group" aria-labelledby="add-tags-label"></div>
+        <input id="add-newtag" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="done" placeholder="Nueva etiqueta" aria-label="Nueva etiqueta">
+        <small>Las nuevas se guardan como en Raycast: en minúsculas y con «_» en lugar de espacios.</small>
+      </div>
+      <label class="field">
+        <span>Nota (opcional)</span>
+        <textarea id="add-note" rows="2" placeholder="Se guarda en el campo de notas"></textarea>
+      </label>
+      <label class="check" id="add-pdf-row">
+        <input type="checkbox" id="add-pdf" checked>
+        <span>Descargar el PDF en abierto y guardarlo en Research Papers Bank</span>
+      </label>
+      <p class="sheet-note" id="add-pdf-note"></p>
+      <p class="form-error" id="add-error" role="alert" hidden></p>
+      <div class="sheet-actions">
+        <button class="btn" value="cancel" type="submit" formnovalidate>Cancelar</button>
+        <button class="btn primary" value="ok" type="submit">Añadir</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="settings-dialog" class="sheet sheet-wide">
     <form id="settings-form">
       <h2 id="settings-title">Conectar con GitHub</h2>

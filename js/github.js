@@ -85,6 +85,17 @@ export class GitHub {
     return { sha: meta.sha, data: await raw.json() };
   }
 
+  /** Crea un archivo nuevo (falla con 422 si ya existe). Devuelve su sha. */
+  async createFile(path, text, message) {
+    const body = { message, content: b64encodeUtf8(text), branch: this.branch };
+    const res = await this.request(this.contentsPath(path), { method: 'PUT', body });
+    return (await res.json()).content?.sha;
+  }
+
+  async deleteFile(path, sha, message) {
+    await this.request(this.contentsPath(path), { method: 'DELETE', body: { message, sha, branch: this.branch } });
+  }
+
   async putJson(path, data, sha, message) {
     const body = {
       message,

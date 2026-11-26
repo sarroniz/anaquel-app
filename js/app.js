@@ -1,7 +1,7 @@
 import { GitHub, GitHubError } from './github.js';
 import * as store from './store.js';
 import { normalizeEntry, search, sortResults, sourceLine, toBibtex, fold, snippet, authorKey, venueKey, parseAuthors } from './library.js';
-import { OpenAlex, buildLibraryIndex, findInLibrary, workToBibtex, titleKey, asDoi } from './openalex.js';
+import { OpenAlex, buildLibraryIndex, findInLibrary, workToBibtex, workToEntry, citeKeyFor, titleKey, asDoi } from './openalex.js';
 
 // ---------------------------------------------------------------- estado
 
@@ -15,6 +15,10 @@ const state = {
   flags: {},               // marcas confirmadas en GitHub
   flagsSha: null,
   pending: [],             // cambios de marcas aún no enviados
+  adds: new Map(),         // cola para añadir a la biblioteca (pendientes/{clave}.json en GitHub): clave → {path, sha, item}
+  addOps: [],              // altas y bajas de la cola aún no enviadas
+  addsStatus: {},          // pendientes/_estado.json: lo que el Mac no pudo importar
+  addsStatusSha: null,
   cached: new Map(),       // PDFs guardados en el dispositivo: clave → sha
   query: '',
   filter: { kind: 'all', value: '', label: '' },   // all | pdf | flagged | topic | author | year | venue
@@ -47,6 +51,9 @@ const els = {
   viewerProgress: $('#viewer-progress'), viewerProgressFill: $('#viewer-progress-fill'), viewerProgressText: $('#viewer-progress-text'),
   viewerFlag: $('#viewer-flag'), zoomLabel: $('#zoom-label'),
   flagDialog: $('#flag-dialog'), flagNote: $('#flag-note'), flagDialogEntry: $('#flag-dialog-entry'),
+  addDialog: $('#add-dialog'), addForm: $('#add-form'), addEntry: $('#add-entry'), addKey: $('#add-key'),
+  addTags: $('#add-tags'), addNewTag: $('#add-newtag'), addNote: $('#add-note'), addPdfRow: $('#add-pdf-row'),
+  addPdf: $('#add-pdf'), addPdfNote: $('#add-pdf-note'), addError: $('#add-error'),
   settingsDialog: $('#settings-dialog'), settingsForm: $('#settings-form'), settingsError: $('#settings-error'),
   settingsTitle: $('#settings-title'), settingsExtra: $('#settings-extra'), offlineSummary: $('#offline-summary'),
   offlineProgress: $('#offline-progress'), offlineProgressFill: $('#offline-progress-fill'),
@@ -57,6 +64,7 @@ const wide = matchMedia('(min-width: 820px)');
 let viewer = null;          // PdfViewer, se carga al abrir el primer PDF
 let downloadAbort = null;
 let flagChain = Promise.resolve();
+let addChain = Promise.resolve();
 
 // ---------------------------------------------------------------- utilidades
 
@@ -135,9 +143,13 @@ function pdfInfo(e) {
 const hasPdf = (e) => !!pdfInfo(e);
 
 async function loadLocal() {
-  const [lib, meta, tree, flags, pending, cached] = await Promise.all([
+  const [lib, meta, tree, flags, pending, cached, adds, addOps, addsStatus] = await Promise.all([
     store.get('library'), store.get('meta'), store.get('tree'), store.get('flags'), store.get('pendingFlags'), store.cachedPdfs(),
+    store.get('adds'), store.get('addOps'), store.get('addsStatus'),
   ]);
+  if (adds) state.adds = new Map(adds);
+  if (addOps) state.addOps = addOps;
+  if (addsStatus) { state.addsStatus = addsStatus.data || {}; state.addsStatusSha = addsStatus.sha || null; }
   if (lib) setLibrary(lib);
   if (meta) { state.libSha = meta.libSha || null; state.lastSync = meta.lastSync || null; state.flagsSha = meta.flagsSha || null; }
   if (tree) state.tree = new Map(tree);
@@ -174,6 +186,7 @@ async function refresh({ quiet = false } = {}) {
     state.tree = items;
     await store.set('tree', [...items]);
     await syncFlags(items.get('flags.json')?.sha || null);
+    await syncAdds(items);
     state.lastSync = Date.now();
     await persistMeta();
   } catch (err) {
@@ -255,6 +268,242 @@ async function clearFlag(key) {
   renderAll();
   toast('Marca quitada');
   pushFlags();
+}
+
+
+// ---------------------------------------------------------------- añadir a la biblioteca
+// Cada alta es un archivo pendientes/{clave}.json en anaquel-datos. El script del Mac lo mete en
+// library.db (y descarga el PDF en abierto) en la siguiente sincronización y borra el archivo.
+// La app solo crea y borra archivos de la cola, y el Mac solo los borra: así nunca chocan.
+
+const QUEUE_DIR = 'pendientes/';
+
+async function persistAdds() {
+  await Promise.all([
+    store.set('adds', [...state.adds]), store.set('addOps', state.addOps),
+    store.set('addsStatus', { data: state.addsStatus, sha: state.addsStatusSha }),
+  ]);
+}
+
+async function syncAdds(items) {
+  const next = new Map();
+  let statusSha = null;
+  for (const [path, info] of items) {
+    if (!path.startsWith(QUEUE_DIR) || !path.endsWith('.json')) continue;
+    const name = path.slice(QUEUE_DIR.length, -5);
+    if (!name || name.includes('/')) continue;
+    if (name === '_estado') { statusSha = info.sha; continue; }
+    if (name.startsWith('_')) continue;
+    const old = state.adds.get(name);
+    let item = old && old.sha === info.sha ? old.item : null;
+    if (!item) {
+      try { item = await (await state.gh.blob(info.sha)).json(); } catch (err) { console.warn(err); continue; }
+    }
+    next.set(name, { path, sha: info.sha, item });
+  }
+  if (statusSha !== state.addsStatusSha) {
+    try {
+      state.addsStatus = statusSha ? (await (await state.gh.blob(statusSha)).json()) || {} : {};
+      state.addsStatusSha = statusSha;
+    } catch (err) { console.warn(err); }
+  }
+  state.adds = next;
+  await persistAdds();
+  if (state.addOps.length) await pushAdds();
+}
+
+async function sendAddOps() {
+  while (state.addOps.length) {
+    const op = state.addOps[0];
+    const path = `${QUEUE_DIR}${op.key}.json`;
+    if (op.op === 'add') {
+      try {
+        const sha = await state.gh.createFile(path, JSON.stringify(op.item, null, 1) + '\n', `Añadir a la biblioteca: ${op.key} (${deviceLabel()})`);
+        state.adds.set(op.key, { path, sha, item: op.item });
+      } catch (err) {
+        // 422: ya hay en la cola un archivo con esa clave (enviado antes desde este u otro dispositivo).
+        if (err.status !== 422) throw err;
+      }
+    } else {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let sha = attempt === 0 ? state.adds.get(op.key)?.sha : null;
+        try {
+          if (!sha) sha = (await state.gh.getJson(path)).sha;
+          await state.gh.deleteFile(path, sha, `Quitar de la cola: ${op.key} (${deviceLabel()})`);
+          break;
+        } catch (err) {
+          if (err.status === 404) break;              // el Mac ya la había importado
+          if ((err.status === 409 || err.status === 422) && attempt === 0) continue;
+          throw err;
+        }
+      }
+      state.adds.delete(op.key);
+    }
+    if (state.addOps[0] === op) state.addOps.shift();
+    await persistAdds();
+  }
+}
+
+function pushAdds() {
+  addChain = addChain.then(async () => {
+    if (!state.gh || !navigator.onLine || !state.addOps.length) { renderStatus(); return; }
+    try {
+      await sendAddOps();
+      state.syncError = null;
+    } catch (err) {
+      state.syncError = err;
+    }
+    renderAll();
+  });
+  return addChain;
+}
+
+function effectiveAdds() {
+  const out = new Map(state.adds);
+  for (const op of state.addOps) {
+    if (op.op === 'add') out.set(op.key, { item: op.item, local: true }); else out.delete(op.key);
+  }
+  return out;
+}
+
+/** ¿Está este resultado de OpenAlex en la cola? Devuelve {key, item, local} o null. */
+function queuedFor(w, adds = effectiveAdds()) {
+  const doi = w.doi?.toLowerCase();
+  for (const [key, a] of adds) {
+    const it = a.item || {};
+    if ((it.openalex && it.openalex === w.id) || (doi && it.fields?.doi?.toLowerCase() === doi)) return { key, ...a };
+  }
+  return null;
+}
+
+/** Igual que normalizeTag() de la extensión de Raycast: minúsculas y espacios o guiones → «_». */
+const normalizeTag = (t) => String(t).trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+
+function libraryTags() {
+  const counts = new Map();
+  for (const e of state.entries) {
+    for (const t of e.topics || []) {
+      const n = normalizeTag(t);
+      if (n) counts.set(n, (counts.get(n) || 0) + 1);
+    }
+  }
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t]) => t);
+}
+
+function keyTaken(key) {
+  const k = key.toLowerCase();
+  return [...state.byKey.keys(), ...effectiveAdds().keys()].some((x) => x.toLowerCase() === k);
+}
+
+function uniqueKey(base) {
+  if (!keyTaken(base)) return base;
+  for (const c of 'bcdefghijklmnopqrstuvwxyz') if (!keyTaken(base + c)) return base + c;
+  return base + Date.now().toString(36);
+}
+
+let addDraft = null;
+
+function askAdd(w) {
+  if (!state.gh) { toast('Conecta primero con GitHub en Ajustes.'); return; }
+  addDraft = { w, tags: [] };
+  els.addEntry.textContent = `${w.authorsShort ? w.authorsShort + ' ' : ''}${w.year ? `(${w.year}) ` : ''}${w.title}`;
+  els.addKey.value = uniqueKey(citeKeyFor(w));
+  els.addNewTag.value = '';
+  els.addNote.value = '';
+  els.addError.hidden = true;
+  els.addPdfRow.hidden = !w.pdfUrl;
+  els.addPdf.checked = !!w.pdfUrl;
+  els.addPdfNote.textContent = w.pdfUrl ? ''
+    : w.oaUrl ? 'Tiene versión en abierto, pero sin enlace directo al PDF: el Mac no puede descargarlo. Añádelo tú cuando lo tengas.'
+      : 'No tiene PDF en abierto. Añádelo tú cuando lo tengas.';
+  renderAddTags();
+  els.addDialog.showModal();
+}
+
+function renderAddTags() {
+  const all = [...new Set([...addDraft.tags, ...libraryTags()])];
+  els.addTags.innerHTML = all.length
+    ? all.map((t) => `<button type="button" class="chip" data-tag="${esc(t)}" aria-pressed="${addDraft.tags.includes(t)}">${esc(t)}</button>`).join('')
+    : '<span class="tag-empty">Tu biblioteca todavía no tiene etiquetas.</span>';
+}
+
+function takeNewTags() {
+  const added = els.addNewTag.value.split(',').map(normalizeTag).filter(Boolean);
+  for (const t of added) if (!addDraft.tags.includes(t)) addDraft.tags.push(t);
+  els.addNewTag.value = '';
+  return added.length;
+}
+
+els.addTags.addEventListener('click', (ev) => {
+  const b = ev.target.closest('[data-tag]');
+  if (!b) return;
+  const t = b.dataset.tag;
+  addDraft.tags = addDraft.tags.includes(t) ? addDraft.tags.filter((x) => x !== t) : [...addDraft.tags, t];
+  b.setAttribute('aria-pressed', String(addDraft.tags.includes(t)));
+});
+
+els.addNewTag.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' || ev.key === ',') {
+    ev.preventDefault();
+    if (takeNewTags()) renderAddTags();
+  }
+});
+
+els.addKey.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ev.preventDefault(); });
+
+els.addForm.addEventListener('submit', (ev) => {
+  if (ev.submitter?.value !== 'ok') return;
+  takeNewTags();
+  const key = els.addKey.value.trim();
+  const err = !key ? 'Escribe una clave.'
+    : !/^[A-Za-z0-9][A-Za-z0-9_:.-]*$/.test(key) ? 'La clave solo puede llevar letras sin acentos, números y los signos _ : . -'
+      : keyTaken(key) ? 'Ya hay una referencia o un artículo en la cola con esa clave.' : '';
+  if (err) {
+    ev.preventDefault();
+    els.addError.textContent = err;
+    els.addError.hidden = false;
+    els.addKey.focus();
+  }
+});
+
+els.addDialog.addEventListener('close', () => {
+  if (els.addDialog.returnValue === 'ok' && addDraft) {
+    queueAdd(addDraft.w, els.addKey.value.trim(), addDraft.tags, els.addNote.value, els.addPdf.checked && !els.addPdfRow.hidden);
+  }
+  addDraft = null;
+});
+
+async function queueAdd(w, key, tags, note, downloadPdf) {
+  const fields = workToEntry(w, key);
+  if (tags.length) fields.source_topic = tags.join(', ');
+  if (note.trim()) fields.notes = note.trim();
+  const item = {
+    format: 1, key, openalex: w.id, fields, bibtex: workToBibtex(w, key),
+    pdf_url: downloadPdf ? w.pdfUrl : '', landing_url: w.oaUrl || w.url || '',
+    added_at: new Date().toISOString(), device: deviceLabel(),
+  };
+  state.addOps.push({ op: 'add', key, item });
+  await persistAdds();
+  renderAll();
+  toast('En cola: el Mac lo añadirá en la próxima sincronización');
+  pushAdds();
+}
+
+async function unqueue(key) {
+  state.addOps.push({ op: 'remove', key });
+  await persistAdds();
+  renderAll();
+  toast('Quitado de la cola');
+  pushAdds();
+}
+
+function queuedNoteHtml(q) {
+  const err = state.addsStatus?.[q.key]?.error;
+  const when = q.local ? 'Se enviará en cuanto haya conexión.' : 'El Mac lo añadirá a tu biblioteca en la próxima sincronización.';
+  return `<div class="queue-note${err ? ' has-error' : ''}">`
+    + `<p><strong>En cola para añadir</strong> con la clave <code>${esc(q.key)}</code>${q.item?.fields?.source_topic ? `, etiquetas: ${esc(q.item.fields.source_topic)}` : ''}. ${when}</p>`
+    + (err ? `<p class="queue-error">El Mac no pudo añadirlo: ${esc(err)}</p>` : '')
+    + `<button type="button" class="link-btn" data-act="web-unqueue" data-key="${esc(q.key)}">Quitar de la cola</button></div>`;
 }
 
 // ---------------------------------------------------------------- lista
@@ -358,8 +607,10 @@ function renderList() {
 }
 
 function renderStatus() {
+  const nQueue = effectiveAdds().size;
+  const queueText = nQueue ? ` ${nQueue === 1 ? '1 artículo en cola para añadir.' : `${nQueue} artículos en cola para añadir.`}` : '';
   if (state.mode === 'web') {
-    els.status.textContent = `Resultados de OpenAlex${state.settings?.openalexKey ? '' : ' (sin clave)'}.`;
+    els.status.textContent = `Resultados de OpenAlex${state.settings?.openalexKey ? '' : ' (sin clave)'}.${queueText}`;
     els.status.dataset.tone = '';
     return;
   }
@@ -375,7 +626,7 @@ function renderStatus() {
     tone = offline ? 'offline' : 'error';
   } else if (state.lastSync) text = `Actualizado ${formatTime(state.lastSync)}.`;
   else text = '';
-  els.status.textContent = text + pendingText;
+  els.status.textContent = text + pendingText + queueText;
   els.status.dataset.tone = tone;
 }
 
@@ -750,6 +1001,7 @@ els.settingsForm.addEventListener('submit', async (ev) => {
     const sameRepo = state.settings && state.settings.owner === owner && state.settings.repo === repo && state.settings.branch === branch;
     if (!sameRepo) {
       state.libSha = null; state.flagsSha = null; state.tree = null; state.flags = {}; state.pending = [];
+      state.adds = new Map(); state.addOps = []; state.addsStatus = {}; state.addsStatusSha = null;
       state.entries = []; state.byKey = new Map(); state.selectedKey = null;
       await store.clearData();
     }
@@ -905,7 +1157,7 @@ function openMenu(row, x, y, { fromTouch = false } = {}) {
     menu.innerHTML = `<p class="ctx-title">${esc(w.authorsShort ? `${w.authorsShort}${w.year ? ` (${w.year})` : ''}` : w.title)}</p>`
       + item('w-bib', 'Copiar BibTeX') + (w.doi ? item('w-doi', 'Copiar DOI') : '')
       + (w.url ? item('w-web', w.doi ? 'Ver en la editorial' : 'Ver en la web') : '')
-      + (inLib ? item('w-lib', 'Ver en mi biblioteca') : '');
+      + (inLib ? item('w-lib', 'Ver en mi biblioteca') : queuedFor(w) ? '' : item('w-add', 'Añadir a la biblioteca…'));
   } else {
     const e = state.byKey.get(row.dataset.key);
     if (!e) return;
@@ -945,6 +1197,7 @@ menu.addEventListener('click', async (ev) => {
     else if (b.dataset.m === 'w-doi') await copy(w.doi, 'DOI copiado');
     else if (b.dataset.m === 'w-web') window.open(w.url, '_blank', 'noopener');
     else if (b.dataset.m === 'w-lib') openInLibrary(findInLibrary(w, state.libIndex));
+    else if (b.dataset.m === 'w-add') askAdd(w);
     return;
   }
   const key = menu.dataset.key;
@@ -1022,6 +1275,8 @@ els.detail.addEventListener('click', async (ev) => {
     }
     case 'web-open-lib': openInLibrary(b.dataset.key); break;
     case 'web-copy-bib': { const w = currentWork(); if (w) await copy(workToBibtex(w), 'BibTeX copiado'); break; }
+    case 'web-add': { const w = currentWork(); if (w) askAdd(w); break; }
+    case 'web-unqueue': unqueue(b.dataset.key); break;
     case 'web-source': {
       const w = currentWork();
       if (w?.sourceId) showRelated('source', { id: w.sourceId, label: w.venue });
@@ -1068,7 +1323,7 @@ async function copy(text, msg) {
 
 $('#btn-settings').addEventListener('click', () => openSettings());
 $('#btn-refresh').addEventListener('click', () => {
-  if (!state.settings) openSettings({ firstRun: true }); else { refresh(); pushFlags(); }
+  if (!state.settings) openSettings({ firstRun: true }); else { refresh(); pushFlags(); pushAdds(); }
 });
 
 window.addEventListener('popstate', () => {
@@ -1111,7 +1366,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-window.addEventListener('online', () => { if (state.gh) { refresh({ quiet: true }); pushFlags(); } });
+window.addEventListener('online', () => { if (state.gh) { refresh({ quiet: true }); pushFlags(); pushAdds(); } });
 window.addEventListener('offline', renderStatus);
 
 
@@ -1218,14 +1473,15 @@ function handleWebFilter(b) {
   }
 }
 
-function workRowHtml(w) {
+function workRowHtml(w, adds) {
   const inLib = findInLibrary(w, state.libIndex);
+  const queued = !inLib && queuedFor(w, adds);
   const sel = w.id === state.web.selectedId;
   return `<li><button type="button" class="row row-web${inLib ? ' in-lib' : ''}" data-wid="${esc(w.id)}"${sel ? ' aria-current="true"' : ''}>`
     + `<span class="row-year">${esc(w.year || '—')}</span>`
     + `<span class="row-body"><span class="row-title">${esc(w.title)}</span>`
     + `<span class="row-sub"><span class="row-authors">${esc(w.authorsShort || 'Sin autor')}</span>${w.venue && state.web.context?.kind !== 'source' ? `<span class="row-venue">${esc(w.venue)}</span>` : ''}</span>`
-    + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}${tieReason(w)}</span></span>`
+    + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${queued ? '<span class="badge-queue">En cola</span>' : ''}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}${tieReason(w)}</span></span>`
     + `<span class="row-marks">${inLib ? '<span class="badge-lib" title="Ya está en tu biblioteca" aria-label="Ya está en tu biblioteca"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
     + `</button></li>`;
 }
@@ -1281,7 +1537,8 @@ function renderWebList() {
   const moreHtml = more
     ? `<li class="more"><button type="button" class="btn" data-act="web-more"${w.loading ? ' disabled' : ''}>${w.loading ? 'Cargando…' : 'Cargar más resultados'}</button>${w.error ? `<p class="more-error">${esc(w.error.message)}</p>` : ''}</li>`
     : '';
-  els.results.innerHTML = w.results.map(workRowHtml).join('') + moreHtml;
+  const adds = effectiveAdds();
+  els.results.innerHTML = w.results.map((r) => workRowHtml(r, adds)).join('') + moreHtml;
 }
 
 async function runWebSearch({ append = false } = {}) {
@@ -1387,7 +1644,8 @@ function renderWorkDetail() {
   const by = names.length > 12 ? `${names.slice(0, 10).join(', ')} y ${names.length - 10} más`
     : names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} y ${names[names.length - 1]}`;
   const openUrl = w.pdfUrl || (w.oaUrl && w.oaUrl !== w.url ? w.oaUrl : '');
-  const primaryTaken = !!inLib;
+  const queued = inLib ? null : queuedFor(w);
+  const primaryTaken = !!inLib || !queued;
   els.detail.innerHTML = `
     <article class="entry entry-web">
       <button type="button" class="back" data-act="back">
@@ -1396,6 +1654,7 @@ function renderWorkDetail() {
       <div class="entry-meta">
         ${kind ? `<span class="entry-kind">${esc(kind)}</span>` : ''}
         ${inLib ? '<span class="badge-lib-lg">En tu biblioteca</span>' : ''}
+        ${queued ? '<span class="badge-queue badge-queue-lg">En cola</span>' : ''}
         ${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}
       </div>
       <h2 class="entry-title">${esc(w.title)}</h2>
@@ -1404,11 +1663,13 @@ function renderWorkDetail() {
 
       <div class="entry-actions">
         ${inLib ? `<button type="button" class="btn primary" data-act="web-open-lib" data-key="${esc(inLib)}">Ver en mi biblioteca</button>` : ''}
+        ${!inLib && !queued ? '<button type="button" class="btn primary" data-act="web-add">Añadir a la biblioteca</button>' : ''}
         ${openUrl ? `<a class="btn${primaryTaken ? '' : ' primary'}" href="${esc(openUrl)}" target="_blank" rel="noopener">${w.pdfUrl ? 'PDF en abierto' : 'Versión en abierto'}</a>` : ''}
         ${w.url ? `<a class="btn${primaryTaken || openUrl ? '' : ' primary'}" href="${esc(w.url)}" target="_blank" rel="noopener">${w.doi ? 'Ver en la editorial' : 'Ver en la web'}</a>` : ''}
         <button type="button" class="btn" data-act="web-copy-bib">Copiar BibTeX</button>
       </div>
 
+      ${queued ? queuedNoteHtml(queued) : ''}
       ${tiesHtml(w)}
 
       <div class="entry-links">

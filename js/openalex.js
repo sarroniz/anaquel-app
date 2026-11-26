@@ -279,9 +279,38 @@ function bibEscape(s) {
   return String(s).replace(/([&%$#_])/g, '\\$1');
 }
 
+const BIB_TYPES = { article: 'article', review: 'article', 'book-chapter': 'incollection', book: 'book', dissertation: 'phdthesis',
+  'proceedings-article': 'inproceedings', preprint: 'misc' };
+
+/**
+ * Campos de la base de datos (columnas de library.db) para añadir un trabajo a la biblioteca.
+ * Texto en Unicode, sin escapes de LaTeX, como guarda add_entry.py.
+ */
+export function workToEntry(work, key = citeKeyFor(work)) {
+  const type = BIB_TYPES[work.type] || 'misc';
+  const f = {
+    cite_key: key,
+    entry_type: type,
+    title: work.title,
+    author: work.authors.map((a) => (a.first ? `${a.last}, ${a.first}` : a.last)).join(' and '),
+    year: work.year,
+    volume: work.volume,
+    number: work.issue,
+    pages: work.pages.replace('–', '--'),
+    doi: work.doi,
+    url: work.doi ? '' : work.url,
+    abstract: work.abstract,
+  };
+  if (type === 'article' || type === 'misc') f.journal = work.venue;
+  else if (type === 'incollection' || type === 'inproceedings') f.booktitle = work.venue;
+  else if (type === 'phdthesis') f.school = work.venue;
+  else if (type === 'book') f.publisher = work.venue;
+  for (const k of Object.keys(f)) if (!f[k]) delete f[k];
+  return f;
+}
+
 export function workToBibtex(work, key = citeKeyFor(work)) {
-  const type = { article: 'article', review: 'article', 'book-chapter': 'incollection', book: 'book', dissertation: 'phdthesis',
-    'proceedings-article': 'inproceedings', preprint: 'misc' }[work.type] || 'misc';
+  const type = BIB_TYPES[work.type] || 'misc';
   const fields = [];
   const add = (k, v) => { if (v) fields.push(`  ${k} = {${v}}`); };
   add('author', work.authors.map((a) => (a.first ? `${a.last}, ${a.first}` : a.last)).map(bibEscape).join(' and '));
