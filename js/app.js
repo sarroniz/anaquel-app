@@ -39,7 +39,12 @@ const state = {
   },
   libAuthors: new Map(),   // clave de autor → nº de referencias en la biblioteca
   libVenues: new Map(),    // clave de revista → nº de referencias en la biblioteca
-  libOa: null,             // {sha, byId: id de OpenAlex → clave, byKey: clave → id}
+  libOa: null,             // {sha, byId: id de OpenAlex → clave, byKey: clave → id, authors, sources, topics}
+  disc: {                  // «Descubrir»: novedades elegidas a partir de la biblioteca
+    items: [], at: 0, loading: false, error: null, selectedId: null,
+    query: '', reason: 'all', days: 30, sort: 'relevance', newIds: new Set(),
+  },
+  discDismissed: new Set(),
   oaInfo: new Map(),       // clave de la biblioteca → {id, cited, refs} en OpenAlex
 };
 
@@ -147,6 +152,9 @@ async function loadLocal() {
     store.get('library'), store.get('meta'), store.get('tree'), store.get('flags'), store.get('pendingFlags'), store.cachedPdfs(),
     store.get('adds'), store.get('addOps'), store.get('addsStatus'),
   ]);
+  const [discFeed, discDismissed] = await Promise.all([store.get('discFeed'), store.get('discDismissed')]);
+  if (discFeed?.items) Object.assign(state.disc, { items: discFeed.items, at: discFeed.at || 0, newIds: new Set(discFeed.newIds || []) });
+  if (discDismissed) state.discDismissed = new Set(discDismissed);
   if (adds) state.adds = new Map(adds);
   if (addOps) state.addOps = addOps;
   if (addsStatus) { state.addsStatus = addsStatus.data || {}; state.addsStatusSha = addsStatus.sha || null; }
@@ -188,6 +196,7 @@ async function refresh({ quiet = false } = {}) {
     await syncFlags(items.get('flags.json')?.sha || null);
     await syncAdds(items);
     state.lastSync = Date.now();
+    warmFeed();
     await persistMeta();
   } catch (err) {
     state.syncError = err;
@@ -270,6 +279,240 @@ async function clearFlag(key) {
   pushFlags();
 }
 
+
+// ---------------------------------------------------------------- descubrir (novedades a partir de la biblioteca)
+
+const DISC_SORTS = [['relevance', 'Más relevantes'], ['recent', 'Más recientes']];
+const DISC_FETCH_DAYS = 90;
+const DISC_TTL = 12 * 3600 * 1000;
+const DISC_REASONS = [['all', 'Todo'], ['cites', 'Citan tu biblioteca'], ['author', 'Tus autores'], ['journal', 'Tus revistas']];
+const DISC_WINDOWS = [[7, 'Última semana'], [30, 'Último mes'], [90, '3 meses']];
+const DAY = 864e5;
+const MONTHS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+let feedPromise = null;
+
+const fmtDate = (iso) => {
+  if (!iso) return '';
+  const d = new Date(`${iso}T12:00:00`);
+  return Number.isNaN(d) ? '' : d.toLocaleDateString('es-ES', { day: 'numeric', month: 'short', year: 'numeric' }).replace('.', '');
+};
+
+async function persistFeed() {
+  const d = state.disc;
+  await store.set('discFeed', { at: d.at, items: d.items, newIds: [...d.newIds] });
+}
+
+/** Los ids que definen el perfil: tus referencias, tus autores más frecuentes, tus revistas y tus temas. */
+function discProfile() {
+  const p = state.libOa;
+  // Con una biblioteca pequeña (o con pocos DOI) puede que nadie llegue al mínimo: entonces vale con aparecer una vez.
+  const top = (m, k, min) => {
+    const ranked = [...m].sort((a, b) => b[1].n - a[1].n);
+    const strong = ranked.filter(([, x]) => x.n >= min);
+    return (strong.length ? strong : ranked).slice(0, k).map(([id]) => id);
+  };
+  return {
+    libIds: [...p.byId.keys()],
+    authorIds: top(p.authors, 30, 2),
+    sourceIds: top(p.sources, 12, 2),
+    topicIds: top(p.topics, 10, 2),
+  };
+}
+
+/** Carga el perfil (si hace falta) y actualiza las novedades si tienen más de 12 horas. */
+function warmFeed() {
+  if (!state.settings || !navigator.onLine || !state.entries.length) return;
+  Promise.resolve(ensureLibraryIds()).then(() => loadFeed());
+}
+
+function loadFeed({ force = false } = {}) {
+  const d = state.disc;
+  if (feedPromise) return feedPromise;
+  if (!state.settings || !navigator.onLine) return null;
+  if (!force && d.at && Date.now() - d.at < DISC_TTL) return null;
+  feedPromise = (async () => {
+    if (!state.libOa) await ensureLibraryIds();
+    if (!state.libOa?.byId.size) return;
+    d.loading = true;
+    d.error = null;
+    if (state.mode === 'discover') { renderDiscList(); renderStatus(); }
+    try {
+      const fromDate = new Date(Date.now() - DISC_FETCH_DAYS * DAY).toISOString().slice(0, 10);
+      const found = await oa().discover({ ...discProfile(), fromDate });
+      const items = [...found.values()].map(({ work, via }) => ({ work, via: [...via] }));
+      const seenList = (await store.get('discSeen')) || [];
+      const seen = new Set(seenList);
+      // La primera vez no se marca nada como nuevo: sería todo.
+      d.newIds = seenList.length ? new Set(items.map((i) => i.work.id).filter((id) => !seen.has(id))) : new Set();
+      for (const i of items) seen.add(i.work.id);
+      await store.set('discSeen', [...seen].slice(-6000));
+      if (d.selectedId && !items.some((i) => i.work.id === d.selectedId)) d.selectedId = null;
+      d.items = items;
+      d.at = Date.now();
+      await persistFeed();
+    } catch (err) {
+      d.error = err;
+    } finally {
+      d.loading = false;
+    }
+    renderTabBadge();
+    if (state.mode === 'discover') renderAll();
+  })().finally(() => { feedPromise = null; });
+  return feedPromise;
+}
+
+/** Por qué se recomienda cada trabajo, con una puntuación para ordenar. */
+function discScored() {
+  const d = state.disc;
+  const p = state.libOa;
+  const now = Date.now();
+  const out = [];
+  const minAuthorN = p && [...p.authors.values()].some((a) => a.n >= 2) ? 2 : 1;
+  for (const it of d.items) {
+    const w = it.work;
+    if (state.discDismissed.has(w.id) || findInLibrary(w, state.libIndex)) continue;
+    // Citar un clásico muy citado dice menos que citar un trabajo especializado: cada cita pesa según lo citado que esté.
+    const citedIds = p ? [...new Set(w.refIds.filter((r) => p.byId.has(r)))] : [];
+    citedIds.sort((a, b) => (p.citedById.get(a) || 0) - (p.citedById.get(b) || 0));
+    const cited = citedIds.map((r) => p.byId.get(r));
+    const citeWeight = citedIds.reduce((sum, r) => sum + Math.min(2, Math.max(0.5, 3 / Math.log10((p.citedById.get(r) || 0) + 10))), 0);
+    const authors = p ? (w.authorIds || []).map((a) => p.authors.get(a)).filter((a) => a && a.n >= minAuthorN) : [];
+    const src = p?.sources.get((w.sourceId || '').split('/').pop());
+    const topic = p?.topics.get(w.topicId);
+    const journal = it.via.includes('journal') && src ? src.name : '';
+    const age = w.date ? Math.max(0, (now - Date.parse(`${w.date}T12:00:00`)) / DAY) : DISC_FETCH_DAYS;
+    let score = 0;
+    if (cited.length) score += Math.min(12, 2 + 2 * citeWeight);
+    for (const a of authors.slice(0, 3)) score += 3 + Math.min(a.n, 10) / 2;
+    if (journal) score += 3;
+    else if (topic && topic.n >= 3) score += 1;
+    score += Math.max(0, 1 - age / DISC_FETCH_DAYS);
+    out.push({ w, via: it.via, cited, authors, journal, score, age, isNew: d.newIds.has(w.id) });
+  }
+  return out;
+}
+
+function discVisible() {
+  const d = state.disc;
+  const q = fold(d.query.trim());
+  const words = q ? q.split(/\s+/) : [];
+  const list = discScored().filter((x) => {
+    if (x.age > d.days) return false;
+    if (d.reason === 'cites' && !x.cited.length) return false;
+    if (d.reason === 'author' && !x.authors.length) return false;
+    if (d.reason === 'journal' && !x.journal) return false;
+    if (words.length) {
+      const hay = fold(`${x.w.title} ${x.w.authors.map((a) => `${a.first} ${a.last}`).join(' ')} ${x.w.venue}`);
+      if (!words.every((t) => hay.includes(t))) return false;
+    }
+    return true;
+  });
+  const byDate = (a, b) => (b.w.date || '').localeCompare(a.w.date || '');
+  return list.sort(d.sort === 'recent' ? byDate : (a, b) => b.score - a.score || byDate(a, b));
+}
+
+function discReasonsHtml(x) {
+  const parts = [];
+  if (x.cited.length) {
+    const e = state.byKey.get(x.cited[0]);
+    const first = e ? entryLabel(e) : x.cited[0];
+    parts.push(x.cited.length > 1 ? `Cita ${first} y ${x.cited.length - 1} más de tu biblioteca` : `Cita ${first}, de tu biblioteca`);
+  }
+  if (x.authors.length) parts.push(`Nuevo de ${x.authors.slice(0, 2).map((a) => a.name).join(' y ')}`);
+  if (x.journal && parts.length < 2) parts.push(`En ${x.journal}, sobre tus temas`);
+  return parts.slice(0, 2).map((t) => `<span class="row-reason">${esc(t)}</span>`).join('');
+}
+
+function renderDiscFilters() {
+  const d = state.disc;
+  let html = DISC_REASONS.map(([v, l]) => `<button type="button" class="chip" aria-pressed="${d.reason === v}" data-kind="disc-reason" data-value="${v}">${l}</button>`).join('');
+  html += '<span class="chip-sep" aria-hidden="true"></span>';
+  html += DISC_WINDOWS.map(([v, l]) => `<button type="button" class="chip" aria-pressed="${d.days === v}" data-kind="disc-days" data-value="${v}">${l}</button>`).join('');
+  els.filters.innerHTML = html;
+}
+
+function handleDiscFilter(b) {
+  const d = state.disc;
+  if (b.dataset.kind === 'disc-reason') d.reason = b.dataset.value;
+  else if (b.dataset.kind === 'disc-days') d.days = Number(b.dataset.value);
+  renderDiscFilters();
+  renderDiscList();
+  els.results.scrollTop = 0;
+}
+
+function renderDiscList() {
+  const d = state.disc;
+  els.sort.value = d.sort;
+  if (!state.settings) {
+    els.count.textContent = '';
+    els.results.innerHTML = '<li class="empty">Conecta tu biblioteca en Ajustes para ver novedades.</li>';
+    return;
+  }
+  if (!d.items.length) {
+    els.count.textContent = d.loading ? 'Buscando…' : '';
+    els.results.innerHTML = d.loading ? '<li class="empty">Buscando novedades a partir de tu biblioteca…</li>'
+      : d.error ? `<li class="empty">${esc(d.error.message)}<div><button type="button" class="btn" data-act="disc-retry">Reintentar</button></div></li>`
+        : !navigator.onLine ? '<li class="empty">Sin conexión. Las novedades se buscarán cuando vuelvas a tenerla.</li>'
+          : state.libOa && !state.libOa.byId.size ? '<li class="empty">Para recomendarte artículos, tus referencias necesitan DOI.</li>'
+            : '<li class="empty">Preparando tus novedades…</li>';
+    return;
+  }
+  const list = discVisible();
+  const nNew = list.filter((x) => x.isNew).length;
+  els.count.textContent = `${list.length} ${list.length === 1 ? 'novedad' : 'novedades'}${nNew ? `, ${nNew} ${nNew === 1 ? 'nueva' : 'nuevas'}` : ''}`;
+  if (!list.length) {
+    els.results.innerHTML = `<li class="empty">${d.query.trim() ? `Nada coincide con «${esc(d.query.trim())}».`
+      : d.days < DISC_FETCH_DAYS ? 'Nada con este filtro en este periodo. Prueba con «3 meses».' : 'Nada con este filtro.'}</li>`;
+    return;
+  }
+  const adds = effectiveAdds();
+  els.results.innerHTML = list.map((x) => workRowHtml(x.w, adds, { isNew: x.isNew, reasons: discReasonsHtml(x) })).join('')
+    + (d.error ? `<li class="more"><p class="more-error">No se pudieron actualizar: ${esc(d.error.message)}</p><button type="button" class="btn" data-act="disc-retry">Reintentar</button></li>` : '');
+}
+
+/** Número de novedades sin ver en la pestaña. */
+function renderTabBadge() {
+  const tab = document.querySelector('.mode-switch [data-mode="discover"]');
+  if (!tab) return;
+  const n = state.disc.newIds.size ? discScored().filter((x) => x.isNew && x.age <= DISC_FETCH_DAYS).length : 0;
+  let badge = tab.querySelector('.tab-count');
+  if (!n) { badge?.remove(); tab.setAttribute('aria-label', 'Descubrir'); return; }
+  if (!badge) { badge = document.createElement('span'); badge.className = 'tab-count'; tab.append(badge); }
+  badge.textContent = n > 99 ? '99+' : String(n);
+  tab.setAttribute('aria-label', `Descubrir, ${n} ${n === 1 ? 'novedad nueva' : 'novedades nuevas'}`);
+}
+
+function discWhyHtml(w) {
+  const x = discScored().find((i) => i.w.id === w.id);
+  const parts = [];
+  if (x?.cited.length) {
+    const shown = x.cited.slice(0, 6).map((k) => {
+      const e = state.byKey.get(k);
+      return `<button type="button" class="facet" data-act="web-open-lib" data-key="${esc(k)}">${esc(e ? entryLabel(e) : k)}</button>`;
+    });
+    const rest = x.cited.length - shown.length;
+    parts.push(`Cita ${x.cited.length === 1 ? 'un trabajo' : `${x.cited.length} trabajos`} de tu biblioteca: ${shown.join(', ')}${rest > 0 ? ` y ${rest} más` : ''}.`);
+  }
+  if (x?.authors.length) {
+    parts.push(`${x.authors.length > 1 ? 'Autores' : 'Autor'} con varias referencias en tu biblioteca: ${esc(x.authors.map((a) => `${a.name} (${a.n})`).join(', '))}.`);
+  }
+  if (x?.journal) parts.push(`Publicado en ${esc(x.journal)}, una de tus revistas, sobre ${esc(w.topicName || 'tus temas')}.`);
+  return `<div class="entry-affinity disc-why">${parts.length ? `<p>${parts.join(' ')}</p>` : ''}`
+    + '<button type="button" class="link-btn" data-act="disc-hide">No me interesa</button></div>';
+}
+
+async function dismissWork(id) {
+  const d = state.disc;
+  state.discDismissed.add(id);
+  d.newIds.delete(id);
+  if (d.selectedId === id) {
+    d.selectedId = null;
+    if (!wide.matches) backToList();
+  }
+  await Promise.all([store.set('discDismissed', [...state.discDismissed].slice(-6000)), persistFeed()]);
+  renderAll();
+  toast('No volverá a aparecer en este dispositivo');
+}
 
 // ---------------------------------------------------------------- añadir a la biblioteca
 // Cada alta es un archivo pendientes/{clave}.json en anaquel-datos. El script del Mac lo mete en
@@ -537,6 +780,7 @@ function renderSort() {
 
 function renderFilters() {
   if (state.mode === 'web') { renderWebFilters(); return; }
+  if (state.mode === 'discover') { renderDiscFilters(); return; }
   const flags = effectiveFlags();
   const nFlag = state.entries.filter((e) => flags[e.key]).length;
   const nPdf = state.entries.filter(hasPdf).length;
@@ -585,7 +829,9 @@ function rowHtml(e, flags, hit = null) {
 }
 
 function renderList() {
+  renderTabBadge();
   if (state.mode === 'web') { renderWebList(); return; }
+  if (state.mode === 'discover') { renderDiscList(); return; }
   computeResults();
   renderSort();
   const flags = effectiveFlags();
@@ -614,6 +860,13 @@ function renderStatus() {
     els.status.dataset.tone = '';
     return;
   }
+  if (state.mode === 'discover') {
+    const d = state.disc;
+    els.status.textContent = (d.loading ? 'Buscando novedades…'
+      : d.at ? `Novedades de OpenAlex, actualizadas ${formatTime(d.at)}.` : 'Novedades de OpenAlex.') + queueText;
+    els.status.dataset.tone = '';
+    return;
+  }
   const pending = state.pending.length;
   const pendingText = pending ? ` ${pending === 1 ? '1 marca pendiente de enviar.' : `${pending} marcas pendientes de enviar.`}` : '';
   let text;
@@ -633,7 +886,7 @@ function renderStatus() {
 // ---------------------------------------------------------------- ficha
 
 function renderDetail({ animateFlag } = {}) {
-  if (state.mode === 'web') { renderWorkDetail(); return; }
+  if (state.mode !== 'library') { renderWorkDetail(); return; }
   const e = state.byKey.get(state.selectedKey);
   if (!e) {
     els.detail.innerHTML = state.entries.length
@@ -757,17 +1010,17 @@ function select(key, { push = true, focusDetail = false } = {}) {
 
 function backToList() {
   els.app.dataset.view = 'list';
-  const row = state.mode === 'web'
-    ? els.results.querySelector(`.row[data-wid="${CSS.escape(state.web.selectedId || '')}"]`)
+  const row = state.mode !== 'library'
+    ? els.results.querySelector(`.row[data-wid="${CSS.escape(workBucket().selectedId || '')}"]`)
     : els.results.querySelector(`.row[data-key="${CSS.escape(state.selectedKey || '')}"]`);
   row?.scrollIntoView({ block: 'nearest' });
 }
 
 function moveSelection(delta) {
-  if (state.mode === 'web') {
-    const list = state.web.results;
+  if (state.mode !== 'library') {
+    const list = state.mode === 'discover' ? discVisible().map((x) => x.w) : state.web.results;
     if (!list.length) return;
-    const i = list.findIndex((w) => w.id === state.web.selectedId);
+    const i = list.findIndex((w) => w.id === workBucket().selectedId);
     const next = list[Math.min(list.length - 1, Math.max(0, i + delta))];
     if (!next) return;
     selectWork(next.id, { push: false });
@@ -1002,6 +1255,7 @@ els.settingsForm.addEventListener('submit', async (ev) => {
     if (!sameRepo) {
       state.libSha = null; state.flagsSha = null; state.tree = null; state.flags = {}; state.pending = [];
       state.adds = new Map(); state.addOps = []; state.addsStatus = {}; state.addsStatusSha = null;
+      Object.assign(state.disc, { items: [], at: 0, newIds: new Set(), selectedId: null }); state.discDismissed = new Set();
       state.entries = []; state.byKey = new Map(); state.selectedKey = null;
       await store.clearData();
     }
@@ -1059,6 +1313,11 @@ $('#btn-forget').addEventListener('click', async () => {
 let searchT;
 els.q.addEventListener('input', () => {
   if (state.mode === 'web') { state.web.query = els.q.value; return; }   // en OpenAlex se busca al pulsar Intro
+  if (state.mode === 'discover') {
+    clearTimeout(searchT);
+    searchT = setTimeout(() => { state.disc.query = els.q.value; renderDiscList(); els.results.scrollTop = 0; }, 80);
+    return;
+  }
   clearTimeout(searchT);
   searchT = setTimeout(() => {
     state.query = els.q.value;
@@ -1068,6 +1327,12 @@ els.q.addEventListener('input', () => {
 });
 
 els.q.addEventListener('keydown', (ev) => {
+  if (state.mode === 'discover') {
+    if (ev.key === 'Enter') { ev.preventDefault(); els.q.blur(); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); moveSelection(state.disc.selectedId ? 1 : 0); }
+    else if (ev.key === 'Escape' && els.q.value) { els.q.value = ''; state.disc.query = ''; renderDiscList(); }
+    return;
+  }
   if (state.mode === 'web') {
     if (ev.key === 'Enter') { ev.preventDefault(); runWebSearch(); if (!wide.matches) els.q.blur(); }
     else if (ev.key === 'ArrowDown') { ev.preventDefault(); moveSelection(state.web.selectedId ? 1 : 0); }
@@ -1084,6 +1349,12 @@ els.q.addEventListener('keydown', (ev) => {
 });
 
 els.sort.addEventListener('change', () => {
+  if (state.mode === 'discover') {
+    state.disc.sort = els.sort.value;
+    renderDiscList();
+    els.results.scrollTop = 0;
+    return;
+  }
   if (state.mode === 'web') {
     const prev = state.web.sort;
     state.web.sort = els.sort.value;
@@ -1107,6 +1378,7 @@ els.filters.addEventListener('click', (ev) => {
   const b = ev.target.closest('.chip');
   if (!b) return;
   if (state.mode === 'web') { handleWebFilter(b); return; }
+  if (state.mode === 'discover') { handleDiscFilter(b); return; }
   const kind = b.dataset.kind;
   const value = b.dataset.value || '';
   const same = state.filter.kind === kind && state.filter.value === value;
@@ -1120,6 +1392,7 @@ els.results.addEventListener('click', (ev) => {
   const act = ev.target.closest('[data-act]')?.dataset.act;
   if (act === 'web-more') { runWebSearch({ append: true }); return; }
   if (act === 'web-retry') { runWebSearch({ append: false, retry: true }); return; }
+  if (act === 'disc-retry') { loadFeed({ force: true }); return; }
   const row = ev.target.closest('.row');
   if (!row) return;
   if (suppressRowClick) { suppressRowClick = false; ev.preventDefault(); return; }
@@ -1149,7 +1422,7 @@ function openMenu(row, x, y, { fromTouch = false } = {}) {
   if (row.dataset.aid || row.dataset.sid) return;
   const item = (m, label) => `<button type="button" role="menuitem" data-m="${m}">${label}</button>`;
   if (row.dataset.wid) {
-    const w = state.web.results.find((r) => r.id === row.dataset.wid);
+    const w = workList().find((r) => r.id === row.dataset.wid);
     if (!w) return;
     const inLib = findInLibrary(w, state.libIndex);
     menu.dataset.key = '';
@@ -1157,7 +1430,8 @@ function openMenu(row, x, y, { fromTouch = false } = {}) {
     menu.innerHTML = `<p class="ctx-title">${esc(w.authorsShort ? `${w.authorsShort}${w.year ? ` (${w.year})` : ''}` : w.title)}</p>`
       + item('w-bib', 'Copiar BibTeX') + (w.doi ? item('w-doi', 'Copiar DOI') : '')
       + (w.url ? item('w-web', w.doi ? 'Ver en la editorial' : 'Ver en la web') : '')
-      + (inLib ? item('w-lib', 'Ver en mi biblioteca') : queuedFor(w) ? '' : item('w-add', 'Añadir a la biblioteca…'));
+      + (inLib ? item('w-lib', 'Ver en mi biblioteca') : queuedFor(w) ? '' : item('w-add', 'Añadir a la biblioteca…'))
+      + (state.mode === 'discover' ? item('w-hide', 'No me interesa') : '');
   } else {
     const e = state.byKey.get(row.dataset.key);
     if (!e) return;
@@ -1190,7 +1464,7 @@ menu.addEventListener('click', async (ev) => {
   const b = ev.target.closest('[data-m]');
   if (!b) return;
   if (menu.dataset.wid) {
-    const w = state.web.results.find((r) => r.id === menu.dataset.wid);
+    const w = workList().find((r) => r.id === menu.dataset.wid);
     closeMenu();
     if (!w) return;
     if (b.dataset.m === 'w-bib') await copy(workToBibtex(w), 'BibTeX copiado');
@@ -1198,6 +1472,7 @@ menu.addEventListener('click', async (ev) => {
     else if (b.dataset.m === 'w-web') window.open(w.url, '_blank', 'noopener');
     else if (b.dataset.m === 'w-lib') openInLibrary(findInLibrary(w, state.libIndex));
     else if (b.dataset.m === 'w-add') askAdd(w);
+    else if (b.dataset.m === 'w-hide') dismissWork(w.id);
     return;
   }
   const key = menu.dataset.key;
@@ -1276,6 +1551,7 @@ els.detail.addEventListener('click', async (ev) => {
     case 'web-open-lib': openInLibrary(b.dataset.key); break;
     case 'web-copy-bib': { const w = currentWork(); if (w) await copy(workToBibtex(w), 'BibTeX copiado'); break; }
     case 'web-add': { const w = currentWork(); if (w) askAdd(w); break; }
+    case 'disc-hide': { const w = currentWork(); if (w) dismissWork(w.id); break; }
     case 'web-unqueue': unqueue(b.dataset.key); break;
     case 'web-source': {
       const w = currentWork();
@@ -1323,7 +1599,9 @@ async function copy(text, msg) {
 
 $('#btn-settings').addEventListener('click', () => openSettings());
 $('#btn-refresh').addEventListener('click', () => {
-  if (!state.settings) openSettings({ firstRun: true }); else { refresh(); pushFlags(); pushAdds(); }
+  if (!state.settings) { openSettings({ firstRun: true }); return; }
+  refresh(); pushFlags(); pushAdds();
+  if (state.mode === 'discover') loadFeed({ force: true });
 });
 
 window.addEventListener('popstate', () => {
@@ -1334,7 +1612,7 @@ window.addEventListener('popstate', () => {
 wide.addEventListener('change', () => { if (wide.matches) els.app.dataset.view = 'list'; });
 
 document.addEventListener('keydown', (ev) => {
-  if (els.settingsDialog.open || els.flagDialog.open || !menu.hidden) return;
+  if (els.settingsDialog.open || els.flagDialog.open || els.addDialog.open || !menu.hidden) return;
   const typing = ev.target.matches('input, textarea, select');
   if (!els.viewer.hidden) {
     if (ev.key === 'Escape') closeViewer();
@@ -1397,23 +1675,29 @@ function oa() {
 
 const fmtN = (n) => Number(n || 0).toLocaleString('es-ES');
 const entryLabel = (x) => `${x.authorsShort || 'Sin autor'}${x.year ? ` (${x.year})` : ''}`;
-const currentWork = () => state.web.results.find((w) => w.id === state.web.selectedId) || null;
+const workBucket = () => (state.mode === 'discover' ? state.disc : state.web);
+const workList = () => (state.mode === 'discover' ? state.disc.items.map((i) => i.work) : state.web.results);
+const currentWork = () => workList().find((w) => w.id === workBucket().selectedId) || null;
 
 function setMode(mode) {
   if (state.mode === mode) return;
   closeMenu();
-  if (state.mode === 'library') state.query = els.q.value; else state.web.query = els.q.value;
+  if (state.mode === 'library') state.query = els.q.value;
+  else if (state.mode === 'web') state.web.query = els.q.value;
+  else state.disc.query = els.q.value;
   state.mode = mode;
   els.app.dataset.mode = mode;
   for (const b of document.querySelectorAll('.mode-switch [data-mode]')) b.setAttribute('aria-selected', String(b.dataset.mode === mode));
-  els.q.value = mode === 'library' ? state.query : state.web.query;
-  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : webPlaceholder();
-  els.q.setAttribute('aria-label', mode === 'library' ? 'Buscar en la biblioteca' : 'Buscar artículos en OpenAlex');
-  els.sort.innerHTML = (mode === 'library' ? LIB_SORTS : WEB_SORTS).map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  els.q.value = mode === 'library' ? state.query : mode === 'web' ? state.web.query : state.disc.query;
+  els.q.placeholder = mode === 'library' ? 'Título, autor, año, etiqueta, clave…' : mode === 'web' ? webPlaceholder() : 'Filtrar las novedades';
+  els.q.setAttribute('aria-label', mode === 'library' ? 'Buscar en la biblioteca' : mode === 'web' ? 'Buscar artículos en OpenAlex' : 'Filtrar las novedades');
+  els.sort.innerHTML = (mode === 'library' ? LIB_SORTS : mode === 'web' ? WEB_SORTS : DISC_SORTS).map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  els.sort.closest('.sort').hidden = false;
   els.results.scrollTop = 0;
   if (!wide.matches) els.app.dataset.view = 'list';
   renderAll();
   if (mode === 'web') ensureLibraryIds();
+  if (mode === 'discover') warmFeed();
 }
 
 document.querySelector('.mode-switch').addEventListener('click', (ev) => {
@@ -1473,15 +1757,19 @@ function handleWebFilter(b) {
   }
 }
 
-function workRowHtml(w, adds) {
+function workRowHtml(w, adds, extra = null) {
   const inLib = findInLibrary(w, state.libIndex);
   const queued = !inLib && queuedFor(w, adds);
-  const sel = w.id === state.web.selectedId;
+  const sel = w.id === workBucket().selectedId;
   return `<li><button type="button" class="row row-web${inLib ? ' in-lib' : ''}" data-wid="${esc(w.id)}"${sel ? ' aria-current="true"' : ''}>`
-    + `<span class="row-year">${esc(w.year || '—')}</span>`
+    + (extra && w.date
+      ? `<span class="row-year row-day"><span class="d">${Number(w.date.slice(8, 10))}</span>${esc(MONTHS[Number(w.date.slice(5, 7)) - 1] || '')}</span>`
+      : `<span class="row-year">${esc(w.year || '—')}</span>`)
     + `<span class="row-body"><span class="row-title">${esc(w.title)}</span>`
     + `<span class="row-sub"><span class="row-authors">${esc(w.authorsShort || 'Sin autor')}</span>${w.venue && state.web.context?.kind !== 'source' ? `<span class="row-venue">${esc(w.venue)}</span>` : ''}</span>`
-    + `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${queued ? '<span class="badge-queue">En cola</span>' : ''}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}${tieReason(w)}</span></span>`
+    + (extra
+      ? `<span class="row-meta">${extra.isNew ? '<span class="badge-new">Nuevo</span>' : ''}${w.date ? '' : `<span>${esc(w.year)}</span>`}${queued ? '<span class="badge-queue">En cola</span>' : ''}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}</span>${extra.reasons}</span>`
+      : `<span class="row-meta">${w.cited ? `${fmtN(w.cited)} ${w.cited === 1 ? 'cita' : 'citas'}` : 'Sin citas'}${queued ? '<span class="badge-queue">En cola</span>' : ''}${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}${tieReason(w)}</span></span>`)
     + `<span class="row-marks">${inLib ? '<span class="badge-lib" title="Ya está en tu biblioteca" aria-label="Ya está en tu biblioteca"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>' : ''}</span>`
     + `</button></li>`;
 }
@@ -1610,7 +1898,12 @@ async function runWebSearch({ append = false } = {}) {
 }
 
 function selectWork(id, { push = true } = {}) {
-  state.web.selectedId = id;
+  workBucket().selectedId = id;
+  if (state.mode === 'discover' && state.disc.newIds.delete(id)) {
+    els.results.querySelector(`.row[data-wid="${CSS.escape(id)}"] .badge-new`)?.remove();
+    persistFeed();
+    renderTabBadge();
+  }
   for (const b of els.results.querySelectorAll('.row[aria-current]')) b.removeAttribute('aria-current');
   els.results.querySelector(`.row[data-wid="${CSS.escape(id)}"]`)?.setAttribute('aria-current', 'true');
   renderDetail();
@@ -1623,6 +1916,10 @@ function selectWork(id, { push = true } = {}) {
 
 function renderWorkDetail() {
   const w = currentWork();
+  if (!w && state.mode === 'discover') {
+    els.detail.innerHTML = `<div class="detail-empty disc-about"><p>Novedades de los últimos tres meses elegidas a partir de tu biblioteca: trabajos que citan tus referencias, trabajos nuevos de los autores que más tienes y artículos de tus revistas sobre tus temas.</p><p>Se actualizan solas cada 12 horas. Las que no habías visto llevan la etiqueta «Nuevo».</p></div>`;
+    return;
+  }
   if (!w) {
     const sw = state.web;
     const hint = !sw.searched ? 'Los resultados de la búsqueda aparecerán en la lista.'
@@ -1649,10 +1946,10 @@ function renderWorkDetail() {
   els.detail.innerHTML = `
     <article class="entry entry-web">
       <button type="button" class="back" data-act="back">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>Resultados
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>${state.mode === 'discover' ? 'Novedades' : 'Resultados'}
       </button>
       <div class="entry-meta">
-        ${kind ? `<span class="entry-kind">${esc(kind)}</span>` : ''}
+        ${kind ? `<span class="entry-kind">${esc(state.mode === 'discover' && w.date ? [w.typeLabel, fmtDate(w.date)].filter(Boolean).join(', ') : kind)}</span>` : ''}
         ${inLib ? '<span class="badge-lib-lg">En tu biblioteca</span>' : ''}
         ${queued ? '<span class="badge-queue badge-queue-lg">En cola</span>' : ''}
         ${w.isOa ? '<span class="badge-oa">Acceso abierto</span>' : ''}
@@ -1670,7 +1967,7 @@ function renderWorkDetail() {
       </div>
 
       ${queued ? queuedNoteHtml(queued) : ''}
-      ${tiesHtml(w)}
+      ${state.mode === 'discover' ? discWhyHtml(w) : tiesHtml(w)}
 
       <div class="entry-links">
         <span class="entry-links-label">En OpenAlex</span>
@@ -1815,30 +2112,65 @@ function authorRowHtml(a) {
 }
 
 /** Busca (una vez por versión de la biblioteca) el identificador de OpenAlex de tus referencias con DOI. */
+const LIB_CACHE_V = 2;
+
+/**
+ * Enlaza las referencias con OpenAlex (por DOI) y arma el perfil de la biblioteca: autores, revistas y temas.
+ * Guarda cada DOI ya consultado, así que después de una sincronización solo se consultan los nuevos.
+ */
 function ensureLibraryIds() {
   if (!state.entries.length || !navigator.onLine) return null;
   const sha = state.libSha || 'local';
   if (state.libOa?.sha === sha) return null;
   if (libIdsPromise) return libIdsPromise;
   libIdsPromise = (async () => {
-    const cached = await store.get('oaLibIds');
-    let pairs;
-    if (cached?.sha === sha) pairs = cached.pairs;
-    else {
-      const withDoi = state.entries.filter((e) => e.doi);
-      const map = await oa().resolveDois(withDoi.map((e) => e.doi));
-      pairs = withDoi.filter((e) => map.has(e.doi.toLowerCase())).map((e) => [map.get(e.doi.toLowerCase()), e.key]);
-      await store.set('oaLibIds', { sha, pairs });
+    let cache = await store.get('oaLibCache');
+    if (cache?.v !== LIB_CACHE_V) cache = { v: LIB_CACHE_V, byDoi: {} };
+    const now = Date.now();
+    const withDoi = state.entries.filter((e) => e.doi);
+    const todo = [...new Set(withDoi.map((e) => e.doi.toLowerCase()))].filter((d) => {
+      const c = cache.byDoi[d];
+      return !c || (c.miss && now - c.miss > 7 * 864e5);   // los que OpenAlex no conocía se reintentan cada semana
+    });
+    if (todo.length) {
+      const recs = await oa().libraryRecords(todo);
+      for (const d of todo) cache.byDoi[d] = recs.get(d) || { miss: now };
+      await store.set('oaLibCache', cache);
     }
-    state.libOa = { sha, byId: new Map(pairs), byKey: new Map(pairs.map(([id, k]) => [k, id])) };
+    state.libOa = buildLibProfile(sha, withDoi, cache.byDoi);
     tiesVersion++;
     if (state.mode === 'web') {
       if (state.web.sort === 'affinity') applyAffinity();
       renderWebList();
       renderDetail();
+    } else if (state.mode === 'discover') {
+      renderDiscList();
     }
   })().catch((err) => console.warn('No se pudieron enlazar las referencias con OpenAlex', err)).finally(() => { libIdsPromise = null; });
   return libIdsPromise;
+}
+
+function buildLibProfile(sha, withDoi, byDoi) {
+  const pairs = [];
+  const citedById = new Map();
+  const authors = new Map();
+  const sources = new Map();
+  const topics = new Map();
+  const bump = (m, [id, name]) => {
+    const x = m.get(id) || { name, n: 0 };
+    x.n++;
+    m.set(id, x);
+  };
+  for (const e of withDoi) {
+    const r = byDoi[e.doi.toLowerCase()];
+    if (!r || r.miss) continue;
+    pairs.push([r.id, e.key]);
+    citedById.set(r.id, r.cited || 0);
+    for (const a of r.authors || []) bump(authors, a);
+    if (r.source) bump(sources, r.source);
+    if (r.topic) bump(topics, r.topic);
+  }
+  return { sha, byId: new Map(pairs), byKey: new Map(pairs.map(([id, k]) => [k, id])), citedById, authors, sources, topics };
 }
 
 // Citas de las referencias de la biblioteca

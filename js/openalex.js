@@ -5,7 +5,7 @@ import { fold, parseAuthors, authorsShort } from './library.js';
 const FIELDS = [
   'id', 'doi', 'display_name', 'publication_year', 'type', 'authorships', 'primary_location',
   'cited_by_count', 'referenced_works_count', 'abstract_inverted_index', 'open_access', 'best_oa_location', 'biblio',
-  'referenced_works',
+  'referenced_works', 'publication_date', 'primary_topic',
 ].join(',');
 
 const DOI_RE = /^(?:https?:\/\/(?:dx\.)?doi\.org\/|doi:\s*)?(10\.\d{4,9}\/\S+)$/i;
@@ -160,6 +160,68 @@ export class OpenAlex {
     return out;
   }
 
+  /**
+   * Para el perfil de la biblioteca: por cada DOI, su id, sus autores, su revista y su tema en OpenAlex.
+   * Devuelve un Map doi → registro (solo los DOI que OpenAlex conoce).
+   */
+  async libraryRecords(dois, { signal } = {}) {
+    const out = new Map();
+    const clean = [...new Set(dois.map((d) => d.toLowerCase()).filter((d) => d && !/[|,]/.test(d)))];
+    for (let i = 0; i < clean.length; i += 50) {
+      const chunk = clean.slice(i, i + 50);
+      const data = await this.get('/works', {
+        filter: `doi:${chunk.join('|')}`, per_page: 50, select: 'id,doi,authorships,primary_location,primary_topic,cited_by_count',
+      }, { signal });
+      for (const w of data.results || []) {
+        const doi = (w.doi || '').replace(/^https?:\/\/(dx\.)?doi\.org\//i, '').toLowerCase();
+        if (!doi) continue;
+        const src = w.primary_location?.source;
+        out.set(doi, {
+          id: w.id.split('/').pop(),
+          cited: w.cited_by_count || 0,
+          authors: (w.authorships || []).filter((a) => a.author?.id).map((a) => [a.author.id.split('/').pop(), a.author.display_name || '']),
+          source: src?.id ? [src.id.split('/').pop(), src.display_name || ''] : null,
+          topic: w.primary_topic?.id ? [w.primary_topic.id.split('/').pop(), w.primary_topic.display_name || ''] : null,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Novedades para «Descubrir», publicadas desde `fromDate` (AAAA-MM-DD):
+   *  - cites: trabajos que citan alguna referencia de la biblioteca;
+   *  - author: trabajos nuevos de los autores que más aparecen en ella;
+   *  - journal: artículos de sus revistas sobre sus temas.
+   * Devuelve un Map id → { work, via: Set }.
+   */
+  async discover({ libIds = [], authorIds = [], sourceIds = [], topicIds = [], fromDate, signal } = {}) {
+    const base = [`from_publication_date:${fromDate}`, 'type:article|book-chapter|preprint|dissertation|book|review', 'is_retracted:false'];
+    const jobs = [];
+    for (let i = 0; i < libIds.length; i += 100) jobs.push(['cites', [`cites:${libIds.slice(i, i + 100).join('|')}`]]);
+    if (authorIds.length) jobs.push(['author', [`authorships.author.id:${authorIds.join('|')}`]]);
+    if (sourceIds.length && topicIds.length) {
+      jobs.push(['journal', [`primary_location.source.id:${sourceIds.join('|')}`, `primary_topic.id:${topicIds.join('|')}`]]);
+    }
+    const out = new Map();
+    const run = async ([via, filters]) => {
+      for (let page = 1; page <= 3; page++) {
+        const data = await this.get('/works', {
+          filter: [...filters, ...base].join(','), sort: 'publication_date:desc', per_page: 100, page, select: FIELDS,
+        }, { signal });
+        for (const raw of data.results || []) {
+          const id = raw.id;
+          if (!out.has(id)) out.set(id, { work: normalizeWork(raw), via: new Set() });
+          out.get(id).via.add(via);
+        }
+        if ((data.meta?.count || 0) <= page * 100) break;
+      }
+    };
+    // De cuatro en cuatro, para no saturar la API.
+    for (let i = 0; i < jobs.length; i += 4) await Promise.all(jobs.slice(i, i + 4).map(run));
+    return out;
+  }
+
   /** Trabajos que citan a `id` (kind = 'cites') o que `id` cita (kind = 'refs'). */
   related(id, kind, opts = {}) {
     const short = id.split('/').pop();
@@ -227,6 +289,10 @@ export function normalizeWork(w) {
     oaUrl: w.open_access?.oa_url || w.best_oa_location?.landing_page_url || '',
     url: doi ? `https://doi.org/${doi}` : (w.primary_location?.landing_page_url || ''),
     refIds: (w.referenced_works || []).map((r) => r.split('/').pop()),
+    date: w.publication_date || '',
+    authorIds: (w.authorships || []).map((a) => (a.author?.id || '').split('/').pop()).filter(Boolean),
+    topicId: (w.primary_topic?.id || '').split('/').pop(),
+    topicName: w.primary_topic?.display_name || '',
   };
 }
 

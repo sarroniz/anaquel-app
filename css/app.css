@@ -147,15 +147,16 @@ a { color: var(--accent); text-underline-offset: .18em; }
 .is-syncing #btn-refresh svg { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* Mi biblioteca / Buscar artículos */
+/* Biblioteca / Buscar / Descubrir */
 .mode-switch {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 3px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px;
   padding: 3px;
   background: color-mix(in srgb, var(--ink) 7%, transparent);
   border-radius: 11px;
 }
 .mode-switch button {
-  padding: .48rem .5rem;
+  display: inline-flex; align-items: center; justify-content: center; gap: .35rem;
+  padding: .48rem .4rem;
   font: 600 .9rem/1.2 var(--sans); color: var(--ink-2);
   background: transparent; border: 0; border-radius: 8px;
 }
@@ -332,6 +333,26 @@ a { color: var(--accent); text-underline-offset: .18em; }
 /* Buscar artículos: modos, autores y afinidad con la biblioteca */
 .chip-sep { flex: none; width: 1.5px; align-self: stretch; margin: .3rem .2rem; background: var(--rule); border-radius: 1px; }
 .reason { color: var(--accent); font-weight: 600; }
+
+/* Descubrir */
+.tab-count {
+  min-width: 1.25rem; padding: .05rem .32rem;
+  font: 700 .72rem/1.25 var(--sans); color: #fff; text-align: center;
+  background: var(--accent); border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+.badge-new {
+  display: inline-block; padding: .04rem .45rem;
+  font: 700 .74rem/1.35 var(--sans); color: #fff;
+  background: var(--accent); border-radius: 999px;
+}
+.row-day { display: grid; justify-items: center; align-content: start; font-size: .8rem; line-height: 1.15; }
+.row-day .d { font: 600 1.25rem/1.1 var(--serif); color: var(--ink-2); }
+.row-reason { display: block; margin-top: .18rem; font: 600 .82rem/1.35 var(--sans); color: var(--accent); }
+.row-reason + .row-reason { margin-top: .05rem; }
+.disc-why p { margin: 0 0 .45rem; }
+.disc-why .link-btn { margin-top: .1rem; }
+.disc-about p { max-width: 34ch; }
 .row-author { align-items: start; }
 .row-author .row-authors { max-width: none; white-space: normal; }
 .author-avatar {
